@@ -1,7 +1,8 @@
 Option Explicit
 
 '==================== USER SETTINGS ====================
-Private Const LAG_UNIT         As String  = "d"      ' suffix for lag; see caveat #1
+Private Const DEBUG_MODE       As Boolean = False    ' True = break on the failing line
+Private Const LAG_UNIT         As String  = "d"      ' see caveat #1
 Private Const CASE_SENSITIVE_IDS As Boolean = True   ' SPD StringIDs are case-sensitive
 Private Const OUT_SHEET        As String  = "Project View"
 Private Const DIAG_SHEET       As String  = "_View Diagnostics"
@@ -12,47 +13,59 @@ Private Const TOKEN_SEP        As String  = vbTab    ' internal delimiter only
 Private Const DIAG_CAP         As Long    = 500
 '=======================================================
 
+Private gStep As String          ' breadcrumb for the error handler
+
+'==================================================================
+' MAIN
+'==================================================================
 Public Sub BuildProjectStyleScheduleView()
 
     Dim wsTSD As Worksheet, wsTasks As Worksheet, wsRel As Worksheet
     Dim aTSD As Variant, aTasks As Variant, aRel As Variant
     Dim hTSD As Object, hTasks As Object, hRel As Object
-    Dim dName As Object, dRowIdx As Object, dPred As Object, dSucc As Object
+    Dim dName As Object, dRowIdx As Object, dPred As Object, dSucc As Object, dSeen As Object
+    Dim diagMissName As Object, diagOrphan As Object, diagUnkType As Object
     Dim cTsdID&, cTsdDur&, cTsdStart&, cTsdFin&
     Dim cTskID&, cTskName&
     Dim cRelP&, cRelS&, cRelT&, cRelL&
-    Dim i&, n&, r&
+    Dim i&, n&, r&, nRelRows&
     Dim sP$, sS$, sT$, sCode$, sTok$, sLag$
     Dim vLag As Variant
     Dim missName&, orphanP&, orphanS&, dupPK&, selfLoop&, unkType&
-    Dim dSeen As Object
-    Dim diagMissName As Object, diagOrphan As Object, diagUnkType As Object
     Dim oldCalc As XlCalculation
+    Dim outA As Variant
+    Dim wsOut As Worksheet
 
-    On Error GoTo Fail
+    gStep = "initialising"
     oldCalc = Application.Calculation
+    If Not DEBUG_MODE Then On Error GoTo Fail
+
     Application.ScreenUpdating = False
     Application.Calculation = xlCalculationManual
     Application.EnableEvents = False
 
     '--- locate sheets -------------------------------------------------
+    gStep = "locating sheets"
     Set wsTSD = FindSheet(Array("taskscheduledata"))
     Set wsTasks = FindSheet(Array("tasks"))
     Set wsRel = FindSheet(Array("taskrelationships", "taskrelationship"))
-    If wsTSD Is Nothing Then Err.Raise 5, , "Cannot find the 'Task Schedule Data' sheet."
-    If wsTasks Is Nothing Then Err.Raise 5, , "Cannot find the 'Tasks' sheet."
-    If wsRel Is Nothing Then Err.Raise 5, , "Cannot find the 'Task Relationships' sheet."
+    If wsTSD Is Nothing Then Err.Raise 5, , "Cannot find a 'Task Schedule Data' sheet. " & _
+        "Run ShowSheetsAndHeaders to list what is present."
+    If wsTasks Is Nothing Then Err.Raise 5, , "Cannot find a 'Tasks' sheet."
+    If wsRel Is Nothing Then Err.Raise 5, , "Cannot find a 'Task Relationships' sheet."
 
     '--- read blocks ---------------------------------------------------
-    aTSD = ReadBlock(wsTSD)
-    aTasks = ReadBlock(wsTasks)
-    aRel = ReadBlock(wsRel)
+    gStep = "reading '" & wsTSD.Name & "'":   aTSD = ReadBlock(wsTSD)
+    gStep = "reading '" & wsTasks.Name & "'": aTasks = ReadBlock(wsTasks)
+    gStep = "reading '" & wsRel.Name & "'":   aRel = ReadBlock(wsRel)
 
+    gStep = "reading header rows"
     Set hTSD = GetHeaders(aTSD)
     Set hTasks = GetHeaders(aTasks)
     Set hRel = GetHeaders(aRel)
 
     '--- resolve columns ----------------------------------------------
+    gStep = "resolving columns on '" & wsTSD.Name & "'"
     cTsdID = FindCol(hTSD, Array("taskid", "id"), "Task ID", wsTSD.Name)
     cTsdDur = FindCol(hTSD, Array("currentduration", "curduration", "durationcurrent"), _
                       "Current Duration", wsTSD.Name)
@@ -61,31 +74,33 @@ Public Sub BuildProjectStyleScheduleView()
     cTsdFin = FindCol(hTSD, Array("currentfinishdate", "currentfinish"), _
                       "Current Finish Date", wsTSD.Name)
 
+    gStep = "resolving columns on '" & wsTasks.Name & "'"
     cTskID = FindCol(hTasks, Array("id", "taskid"), "ID", wsTasks.Name)
     cTskName = FindCol(hTasks, Array("name", "taskname"), "Name", wsTasks.Name)
 
+    gStep = "resolving columns on '" & wsRel.Name & "'"
     cRelP = FindCol(hRel, Array("predecessortaskid", "predecessorid", "predecessor"), _
                     "PredecessorTaskID", wsRel.Name)
     cRelS = FindCol(hRel, Array("successortaskid", "successorid", "successor"), _
                     "SuccessorTaskID", wsRel.Name)
     cRelT = FindCol(hRel, Array("relationshiptypeid", "relationshiptype", "type"), _
                     "RelationshipTypeID", wsRel.Name)
-    cRelL = FindColOpt(hRel, Array("lagduration", "lag"))   ' optional
+    cRelL = FindColOpt(hRel, Array("lagduration", "lag"))      ' optional
 
     '--- dictionaries --------------------------------------------------
+    gStep = "building Tasks name lookup"
     Set dName = NewDict(): Set dRowIdx = NewDict()
     Set dPred = NewDict(): Set dSucc = NewDict(): Set dSeen = NewDict()
     Set diagMissName = NewDict(): Set diagOrphan = NewDict(): Set diagUnkType = NewDict()
 
-    ' Tasks: ID -> Name
     For i = HEADER_ROW + 1 To UBound(aTasks, 1)
         sP = CleanID(aTasks(i, cTskID))
         If Len(sP) > 0 Then
-            If Not dName.Exists(sP) Then dName.Add sP, CStr(NzS(aTasks(i, cTskName)))
+            If Not dName.Exists(sP) Then dName.Add sP, NzS(aTasks(i, cTskName))
         End If
     Next i
 
-    ' Task Schedule Data: ID -> output row order (drives token sort order)
+    gStep = "indexing Task Schedule Data"
     n = 0
     For i = HEADER_ROW + 1 To UBound(aTSD, 1)
         sP = CleanID(aTSD(i, cTsdID))
@@ -94,25 +109,30 @@ Public Sub BuildProjectStyleScheduleView()
             If Not dRowIdx.Exists(sP) Then dRowIdx.Add sP, n
         End If
     Next i
-    If n = 0 Then Err.Raise 5, , "No Task IDs found in '" & wsTSD.Name & "'."
+    If n = 0 Then Err.Raise 5, , "No Task IDs found in column " & cTsdID & _
+        " of '" & wsTSD.Name & "'. Is HEADER_ROW correct?"
 
     '--- build relationship tokens ------------------------------------
+    gStep = "parsing relationships"
+    nRelRows = UBound(aRel, 1) - HEADER_ROW
     For i = HEADER_ROW + 1 To UBound(aRel, 1)
         sP = CleanID(aRel(i, cRelP))
         sS = CleanID(aRel(i, cRelS))
         If Len(sP) > 0 And Len(sS) > 0 Then
 
-            sT = CStr(NzS(aRel(i, cRelT)))
+            sT = NzS(aRel(i, cRelT))
             sCode = RelCode(sT)
             If sCode = "??" Then
                 unkType = unkType + 1
-                If Not diagUnkType.Exists(sT) Then diagUnkType.Add sT, 1
+                If diagUnkType.Count < DIAG_CAP Then
+                    If Not diagUnkType.Exists(sT) Then diagUnkType.Add sT, 1
+                End If
             End If
 
             If cRelL > 0 Then vLag = aRel(i, cRelL) Else vLag = Empty
             sLag = FmtLag(vLag)
 
-            ' PK = Pred + Succ + Type
+            ' PK = Predecessor + Successor + Type
             If dSeen.Exists(sP & "|" & sS & "|" & sT) Then
                 dupPK = dupPK + 1
             Else
@@ -120,31 +140,36 @@ Public Sub BuildProjectStyleScheduleView()
             End If
             If sP = sS Then selfLoop = selfLoop + 1
 
-            ' token describing the PREDECESSOR, filed under the successor
+            ' token naming the PREDECESSOR, filed under the successor
             sTok = MakeToken(sP, sCode, sT, sLag)
             AddTok dPred, sS, SortKey(dRowIdx, sP) & "|" & sTok
 
-            ' token describing the SUCCESSOR, filed under the predecessor
+            ' token naming the SUCCESSOR, filed under the predecessor
             sTok = MakeToken(sS, sCode, sT, sLag)
             AddTok dSucc, sP, SortKey(dRowIdx, sS) & "|" & sTok
 
             If Not dRowIdx.Exists(sP) Then
                 orphanP = orphanP + 1
-                If diagOrphan.Count < DIAG_CAP Then If Not diagOrphan.Exists(sP) Then diagOrphan.Add sP, "Predecessor"
+                If diagOrphan.Count < DIAG_CAP Then
+                    If Not diagOrphan.Exists(sP) Then diagOrphan.Add sP, "Predecessor"
+                End If
             End If
             If Not dRowIdx.Exists(sS) Then
                 orphanS = orphanS + 1
-                If diagOrphan.Count < DIAG_CAP Then If Not diagOrphan.Exists(sS) Then diagOrphan.Add sS, "Successor"
+                If diagOrphan.Count < DIAG_CAP Then
+                    If Not diagOrphan.Exists(sS) Then diagOrphan.Add sS, "Successor"
+                End If
             End If
         End If
     Next i
 
     '--- assemble output ----------------------------------------------
-    Dim outA As Variant
+    gStep = "assembling output array"
     ReDim outA(1 To n + 1, 1 To 7)
-    outA(1, 1) = "Task ID": outA(1, 2) = "Name": outA(1, 3) = "Current Duration"
-    outA(1, 4) = "Current Start Date": outA(1, 5) = "Current Finish Date"
-    outA(1, 6) = "Predecessors": outA(1, 7) = "Successors"
+    outA(1, 1) = "Task ID":            outA(1, 2) = "Name"
+    outA(1, 3) = "Current Duration":   outA(1, 4) = "Current Start Date"
+    outA(1, 5) = "Current Finish Date": outA(1, 6) = "Predecessors"
+    outA(1, 7) = "Successors"
 
     r = 1
     For i = HEADER_ROW + 1 To UBound(aTSD, 1)
@@ -156,47 +181,61 @@ Public Sub BuildProjectStyleScheduleView()
                 outA(r, 2) = dName(sP)
             Else
                 missName = missName + 1
-                If diagMissName.Count < DIAG_CAP Then If Not diagMissName.Exists(sP) Then diagMissName.Add sP, 1
+                If diagMissName.Count < DIAG_CAP Then
+                    If Not diagMissName.Exists(sP) Then diagMissName.Add sP, 1
+                End If
             End If
-            outA(r, 3) = aTSD(i, cTsdDur)
-            outA(r, 4) = aTSD(i, cTsdStart)
-            outA(r, 5) = aTSD(i, cTsdFin)
+            outA(r, 3) = SafeVal(aTSD(i, cTsdDur))
+            outA(r, 4) = SafeVal(aTSD(i, cTsdStart))
+            outA(r, 5) = SafeVal(aTSD(i, cTsdFin))
             If dPred.Exists(sP) Then outA(r, 6) = JoinSorted(dPred(sP))
             If dSucc.Exists(sP) Then outA(r, 7) = JoinSorted(dSucc(sP))
         End If
     Next i
 
     '--- write --------------------------------------------------------
-    Dim wsOut As Worksheet
+    gStep = "writing '" & OUT_SHEET & "'"
     Set wsOut = ResetSheet(OUT_SHEET)
     wsOut.Range("A:A").NumberFormat = "@"
     wsOut.Range("F:G").NumberFormat = "@"
     wsOut.Range("A1").Resize(n + 1, 7).Value = outA
     wsOut.Range("D:E").NumberFormat = "yyyy-mm-dd"
+
+    gStep = "formatting"
     With wsOut.Range("A1").Resize(1, 7)
         .Font.Bold = True
         .Interior.Color = RGB(221, 235, 247)
     End With
+
+    ' non-fatal cosmetics: these fail (1004) if the window isn't frontmost
+    On Error Resume Next
     wsOut.Rows(1).AutoFilter
-    wsOut.Range("A2").Select
+    wsOut.Activate
     ActiveWindow.FreezePanes = False
+    wsOut.Range("A2").Select
     ActiveWindow.FreezePanes = True
     wsOut.Columns("A:G").AutoFit
     If wsOut.Columns("B").ColumnWidth > 55 Then wsOut.Columns("B").ColumnWidth = 55
     If wsOut.Columns("F").ColumnWidth > 45 Then wsOut.Columns("F").ColumnWidth = 45
     If wsOut.Columns("G").ColumnWidth > 45 Then wsOut.Columns("G").ColumnWidth = 45
+    wsOut.Range("F:G").WrapText = False
+    If Not DEBUG_MODE Then On Error GoTo Fail Else On Error GoTo 0
 
-    If WRITE_DIAG Then WriteDiag diagMissName, diagOrphan, diagUnkType, _
-                                n, UBound(aRel, 1) - HEADER_ROW, missName, _
-                                orphanP, orphanS, dupPK, selfLoop, unkType
+    If WRITE_DIAG Then
+        gStep = "writing diagnostics"
+        WriteDiag diagMissName, diagOrphan, diagUnkType, n, nRelRows, missName, _
+                  orphanP, orphanS, dupPK, selfLoop, unkType, (cRelL > 0)
+    End If
 
+    gStep = "done"
     Application.EnableEvents = True
     Application.Calculation = oldCalc
     Application.ScreenUpdating = True
 
     MsgBox "Built '" & OUT_SHEET & "'." & vbCrLf & vbCrLf & _
            "Tasks written:              " & n & vbCrLf & _
-           "Relationship rows read:     " & UBound(aRel, 1) - HEADER_ROW & vbCrLf & _
+           "Relationship rows read:     " & nRelRows & vbCrLf & _
+           "Lag column found:           " & IIf(cRelL > 0, "yes", "NO - lags omitted") & vbCrLf & _
            "Names not found in Tasks:   " & missName & vbCrLf & _
            "Rel. IDs not in Sched Data: " & orphanP & " pred / " & orphanS & " succ" & vbCrLf & _
            "Duplicate PK rows:          " & dupPK & vbCrLf & _
@@ -206,16 +245,51 @@ Public Sub BuildProjectStyleScheduleView()
     Exit Sub
 
 Fail:
-    Application.EnableEvents = True
+    Dim eNum As Long, eDesc As String
+    eNum = Err.Number
+    eDesc = Err.Description                  ' capture BEFORE any On Error resets Err
     On Error Resume Next
-    Application.Calculation = oldCalc
+    Application.EnableEvents = True
+    Application.Calculation = xlCalculationAutomatic
     Application.ScreenUpdating = True
+    Application.DisplayAlerts = True
     On Error GoTo 0
-    MsgBox "Failed: " & Err.Description, vbExclamation
+    MsgBox "Failed while: " & gStep & vbCrLf & vbCrLf & _
+           "Error " & eNum & ": " & eDesc, vbExclamation, "SPD Project View"
 End Sub
 
-'==================== HELPERS ====================
+'==================================================================
+' UTILITIES
+'==================================================================
+Public Sub ResetExcel()
+    Application.EnableEvents = True
+    Application.Calculation = xlCalculationAutomatic
+    Application.ScreenUpdating = True
+    Application.DisplayAlerts = True
+    MsgBox "Excel application settings restored.", vbInformation
+End Sub
 
+Public Sub ShowSheetsAndHeaders()
+    Dim ws As Worksheet, c As Long, lc As Long, h As String
+    Debug.Print String(64, "=")
+    Debug.Print "Workbook: " & ThisWorkbook.Name
+    For Each ws In ThisWorkbook.Worksheets
+        Debug.Print String(64, "-")
+        Debug.Print "SHEET [" & ws.Name & "]  -> norm: " & Norm(ws.Name)
+        lc = ws.Cells(HEADER_ROW, ws.Columns.Count).End(xlToLeft).Column
+        If lc > 60 Then lc = 60
+        For c = 1 To lc
+            h = CStr(ws.Cells(HEADER_ROW, c).Text)
+            If Len(Trim$(h)) > 0 Then _
+                Debug.Print "   col " & c & ": [" & h & "] -> " & Norm(h)
+        Next c
+    Next ws
+    MsgBox "Written to the Immediate window (Ctrl+G in the VBA editor).", vbInformation
+End Sub
+
+'==================================================================
+' HELPERS
+'==================================================================
 Private Function MakeToken(ByVal sID$, ByVal sCode$, ByVal sRaw$, ByVal sLag$) As String
     ' MS Project convention: FS with zero lag shows the bare ID.
     If sCode = "??" Then
@@ -229,18 +303,19 @@ End Function
 
 Private Function RelCode(ByVal s As String) As String
     Select Case Norm(s)
-        Case "finishtostart", "fs": RelCode = "FS"
-        Case "starttostart", "ss":  RelCode = "SS"
+        Case "finishtostart", "fs":  RelCode = "FS"
+        Case "starttostart", "ss":   RelCode = "SS"
         Case "finishtofinish", "ff": RelCode = "FF"
-        Case "starttofinish", "sf": RelCode = "SF"
-        Case Else: RelCode = "??"
+        Case "starttofinish", "sf":  RelCode = "SF"
+        Case Else:                   RelCode = "??"
     End Select
 End Function
 
 Private Function FmtLag(ByVal v As Variant) As String
     Dim d As Double
+    If IsError(v) Then Exit Function
     If IsEmpty(v) Or IsNull(v) Then Exit Function
-    If Trim(CStr(v)) = "" Then Exit Function
+    If Trim$(CStr(v)) = "" Then Exit Function
     If Not IsNumeric(v) Then Exit Function
     d = CDbl(v)
     If d = 0 Then Exit Function
@@ -251,7 +326,7 @@ Private Function SortKey(ByVal dIdx As Object, ByVal sID As String) As String
     If dIdx.Exists(sID) Then
         SortKey = Format$(dIdx(sID), "0000000")
     Else
-        SortKey = "9999999"          ' orphans sort last
+        SortKey = "9999999"                  ' orphan refs sort last
     End If
 End Function
 
@@ -262,7 +337,7 @@ End Sub
 Private Function JoinSorted(ByVal s As String) As String
     Dim a() As String, i&, j&, t$
     a = Split(s, TOKEN_SEP)
-    For i = LBound(a) + 1 To UBound(a)          ' insertion sort
+    For i = LBound(a) + 1 To UBound(a)        ' insertion sort on the numeric prefix
         t = a(i): j = i - 1
         Do While j >= LBound(a)
             If a(j) <= t Then Exit Do
@@ -271,7 +346,7 @@ Private Function JoinSorted(ByVal s As String) As String
         a(j + 1) = t
     Next i
     For i = LBound(a) To UBound(a)
-        a(i) = Mid$(a(i), InStr(a(i), "|") + 1)
+        a(i) = Mid$(a(i), InStr(a(i), "|") + 1)   ' strip the sort prefix
     Next i
     JoinSorted = Join(a, LIST_SEP)
 End Function
@@ -287,26 +362,48 @@ Private Function NzS(ByVal v As Variant) As String
     NzS = CStr(v)
 End Function
 
+Private Function SafeVal(ByVal v As Variant) As Variant
+    If IsError(v) Then SafeVal = CVErr(xlErrNA) Else SafeVal = v
+End Function
+
 Private Function Norm(ByVal s As String) As String
     Dim i&, c$, o$
     s = LCase$(Trim$(s))
     For i = 1 To Len(s)
         c = Mid$(s, i, 1)
-        If InStr(" _-.()/\" & vbTab, c) = 0 Then o = o & c
+        If InStr(" _-.()/\'" & vbTab, c) = 0 Then o = o & c
     Next i
     Norm = o
 End Function
 
 Private Function NewDict() As Object
-    Set NewDict = CreateObject("Scripting.Dictionary")
-    NewDict.CompareMode = IIf(CASE_SENSITIVE_IDS, 0, 1)
+    Dim d As Object
+    Set d = CreateObject("Scripting.Dictionary")
+    d.CompareMode = IIf(CASE_SENSITIVE_IDS, 0, 1)   ' 0=Binary, 1=Text
+    Set NewDict = d
 End Function
 
 Private Function FindSheet(ByVal cands As Variant) As Worksheet
-    Dim ws As Worksheet, k
+    Dim ws As Worksheet, k, nm$, rest$
+    ' pass 1: exact normalised match
     For Each ws In ThisWorkbook.Worksheets
+        nm = Norm(ws.Name)
         For Each k In cands
-            If Norm(ws.Name) = CStr(k) Then Set FindSheet = ws: Exit Function
+            If nm = CStr(k) Then Set FindSheet = ws: Exit Function
+        Next k
+    Next ws
+    ' pass 2: tolerate copies such as "TaskRelationships (2)" -> "taskrelationships2"
+    For Each ws In ThisWorkbook.Worksheets
+        nm = Norm(ws.Name)
+        For Each k In cands
+            If Len(nm) > Len(CStr(k)) Then
+                If Left$(nm, Len(CStr(k))) = CStr(k) Then
+                    rest = Mid$(nm, Len(CStr(k)) + 1)
+                    If rest Like String(Len(rest), "#") Then
+                        Set FindSheet = ws: Exit Function
+                    End If
+                End If
+            End If
         Next k
     Next ws
 End Function
@@ -317,8 +414,11 @@ Private Function ReadBlock(ByVal ws As Worksheet) As Variant
         lr = .Row + .Rows.Count - 1
         lc = .Column + .Columns.Count - 1
     End With
-    If lr <= HEADER_ROW Then Err.Raise 5, , "Sheet '" & ws.Name & "' has no data rows."
+    If lr <= HEADER_ROW Then Err.Raise 5, , "Sheet '" & ws.Name & _
+        "' has a header but no data rows."
     a = ws.Range(ws.Cells(HEADER_ROW, 1), ws.Cells(lr, lc)).Value
+    If Not IsArray(a) Then Err.Raise 5, , "Sheet '" & ws.Name & _
+        "' returned a single cell rather than a table."
     ReadBlock = a
 End Function
 
@@ -343,8 +443,8 @@ End Function
 Private Function FindCol(ByVal d As Object, ByVal cands As Variant, _
                          ByVal label As String, ByVal shName As String) As Long
     FindCol = FindColOpt(d, cands)
-    If FindCol = 0 Then Err.Raise 5, , "Could not find a '" & label & _
-        "' column on sheet '" & shName & "'. Check the header row (row " & HEADER_ROW & ")."
+    If FindCol = 0 Then Err.Raise 5, , "No '" & label & "' column on sheet '" & shName & _
+        "'. Header row is row " & HEADER_ROW & "; run ShowSheetsAndHeaders to see what was read."
 End Function
 
 Private Function ResetSheet(ByVal nm As String) As Worksheet
@@ -354,7 +454,8 @@ Private Function ResetSheet(ByVal nm As String) As Worksheet
     ThisWorkbook.Worksheets(nm).Delete
     On Error GoTo 0
     Application.DisplayAlerts = True
-    Set ws = ThisWorkbook.Worksheets.Add(After:=ThisWorkbook.Worksheets(ThisWorkbook.Worksheets.Count))
+    Set ws = ThisWorkbook.Worksheets.Add( _
+             After:=ThisWorkbook.Worksheets(ThisWorkbook.Worksheets.Count))
     ws.Name = nm
     Set ResetSheet = ws
 End Function
@@ -362,14 +463,17 @@ End Function
 Private Sub WriteDiag(dName As Object, dOrph As Object, dType As Object, _
                       ByVal nTasks&, ByVal nRel&, ByVal missName&, _
                       ByVal orphP&, ByVal orphS&, ByVal dupPK&, _
-                      ByVal selfL&, ByVal unkT&)
+                      ByVal selfL&, ByVal unkT&, ByVal hadLag As Boolean)
     Dim ws As Worksheet, r&, k
     Set ws = ResetSheet(DIAG_SHEET)
     ws.Range("A1:B1").Value = Array("Check", "Value")
     ws.Range("A1:B1").Font.Bold = True
     r = 2
+    ws.Cells(r, 1) = "Run timestamp":              ws.Cells(r, 2) = Now: r = r + 1
     ws.Cells(r, 1) = "Tasks written":              ws.Cells(r, 2) = nTasks: r = r + 1
     ws.Cells(r, 1) = "Relationship rows read":     ws.Cells(r, 2) = nRel: r = r + 1
+    ws.Cells(r, 1) = "LagDuration column found":   ws.Cells(r, 2) = IIf(hadLag, "yes", "no"): r = r + 1
+    ws.Cells(r, 1) = "Lag unit label used":        ws.Cells(r, 2) = LAG_UNIT: r = r + 1
     ws.Cells(r, 1) = "Names not found in Tasks":   ws.Cells(r, 2) = missName: r = r + 1
     ws.Cells(r, 1) = "Orphan predecessor refs":    ws.Cells(r, 2) = orphP: r = r + 1
     ws.Cells(r, 1) = "Orphan successor refs":      ws.Cells(r, 2) = orphS: r = r + 1
@@ -377,13 +481,19 @@ Private Sub WriteDiag(dName As Object, dOrph As Object, dType As Object, _
     ws.Cells(r, 1) = "Self-referencing links":     ws.Cells(r, 2) = selfL: r = r + 1
     ws.Cells(r, 1) = "Unrecognised rel. types":    ws.Cells(r, 2) = unkT: r = r + 2
 
-    ws.Cells(r, 1) = "Task IDs with no Name (capped " & DIAG_CAP & ")": ws.Cells(r, 1).Font.Bold = True: r = r + 1
-    For Each k In dName.Keys: ws.Cells(r, 1) = k: r = r + 1: Next k
+    ws.Cells(r, 1) = "Task IDs with no Name in Tasks (capped " & DIAG_CAP & ")"
+    ws.Cells(r, 1).Font.Bold = True: r = r + 1
+    For Each k In dName.Keys: ws.Cells(r, 1).NumberFormat = "@": ws.Cells(r, 1) = k: r = r + 1: Next k
     r = r + 1
-    ws.Cells(r, 1) = "Rel. IDs absent from Task Schedule Data": ws.Cells(r, 1).Font.Bold = True: r = r + 1
-    For Each k In dOrph.Keys: ws.Cells(r, 1) = k: ws.Cells(r, 2) = dOrph(k): r = r + 1: Next k
+    ws.Cells(r, 1) = "Relationship IDs absent from Task Schedule Data"
+    ws.Cells(r, 1).Font.Bold = True: r = r + 1
+    For Each k In dOrph.Keys
+        ws.Cells(r, 1).NumberFormat = "@": ws.Cells(r, 1) = k
+        ws.Cells(r, 2) = dOrph(k): r = r + 1
+    Next k
     r = r + 1
-    ws.Cells(r, 1) = "Unrecognised RelationshipTypeID values": ws.Cells(r, 1).Font.Bold = True: r = r + 1
+    ws.Cells(r, 1) = "Unrecognised RelationshipTypeID values"
+    ws.Cells(r, 1).Font.Bold = True: r = r + 1
     For Each k In dType.Keys: ws.Cells(r, 1) = k: r = r + 1: Next k
 
     ws.Columns("A:B").AutoFit
