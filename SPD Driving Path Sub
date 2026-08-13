@@ -60,6 +60,7 @@ Public Sub BuildDrivingPathToTask()
     Dim dS As Double
     Dim dF As Double
     Dim r As Long
+    Dim spanTxt As String
 
     gPStep = "starting"
     On Error GoTo Fail
@@ -143,32 +144,33 @@ Public Sub BuildDrivingPathToTask()
     shName = dpSheetName(targetID)
     Set ws = dpResetSheet(shName)
 
+    dS = dpToDate(mStart(pathIdx(depth)), okS)
+    dF = dpToDate(mFin(tIdx), okF)
+    spanTxt = "not computable"
+    If okS Then
+        If okF Then
+            spanTxt = CStr(dF - dS) & " calendar days"
+        End If
+    End If
+
     ws.Range("A1").Value = "Driving path to"
-    ws.Range("B1").Value = targetID
     ws.Range("B1").NumberFormat = "@"
+    ws.Range("B1").Value = targetID
     ws.Range("A2").Value = "Task name"
     ws.Range("B2").Value = mNames(tIdx)
     ws.Range("A3").Value = "Steps in path"
     ws.Range("B3").Value = depth
     ws.Range("A4").Value = "Chain start"
-    ws.Range("B4").Value = mIDs(pathIdx(depth))
     ws.Range("B4").NumberFormat = "@"
+    ws.Range("B4").Value = mIDs(pathIdx(depth))
     ws.Range("A5").Value = "Walk terminated because"
     ws.Range("B5").Value = stopReason
-    ws.Range("A6").Value = "Source sheet"
-    ws.Range("B6").Value = SRC_SHEET
-    ws.Range("A7").Value = "Generated"
-    ws.Range("B7").Value = CStr(Now)
-
-    dS = dpToDate(mStart(pathIdx(depth)), okS)
-    dF = dpToDate(mFin(tIdx), okF)
-    ws.Range("A8").Value = "Span, first start to target finish"
-    If okS Then
-        If okF Then
-            ws.Range("B8").Value = CStr(dF - dS) & " calendar days"
-        End If
-    End If
-    If Len(CStr(ws.Range("B8").Value)) = 0 Then ws.Range("B8").Value = "not computable"
+    ws.Range("A6").Value = "Span, first start to target finish"
+    ws.Range("B6").Value = spanTxt
+    ws.Range("A7").Value = "Source sheet"
+    ws.Range("B7").Value = SRC_SHEET
+    ws.Range("A8").Value = "Generated"
+    ws.Range("B8").Value = CStr(Now)
     ws.Range("A1:A8").Font.Bold = True
 
     ws.Range("A10").Value = "Step"
@@ -219,6 +221,7 @@ Public Sub BuildDrivingPathToTask()
     End If
 
     If mUnparsed.Count > 0 Then
+        gPStep = "writing unparsed token list"
         r = ws.Cells(ws.Rows.Count, 1).End(xlUp).Row + 2
         ws.Cells(r, 1).Value = "Predecessor tokens that could not be parsed"
         ws.Cells(r, 1).Font.Bold = True
@@ -256,14 +259,83 @@ Fail:
 End Sub
 
 '================================================
+' VERIFICATION
+'================================================
+Public Sub VerifyProjectViewLoad()
+    Dim i As Long
+    Dim n As Long
+    Dim ok1 As Boolean
+    Dim ok2 As Boolean
+    Dim d1 As Double
+    Dim d2 As Double
+    Dim nBadStart As Long
+    Dim nBadFin As Long
+    Dim nNoPred As Long
+    Dim msg As String
+
+    On Error GoTo Fail
+    dpLoadSource
+
+    Debug.Print String(66, "=")
+    Debug.Print "VerifyProjectViewLoad"
+    Debug.Print "Rows loaded: " & mCount
+    Debug.Print String(66, "-")
+
+    n = 5
+    If mCount < n Then n = mCount
+    For i = 1 To n
+        d1 = dpToDate(mStart(i), ok1)
+        d2 = dpToDate(mFin(i), ok2)
+        Debug.Print "ID=[" & mIDs(i) & "]  Name=[" & Left(mNames(i), 34) & "]"
+        Debug.Print "   Start  raw=[" & CStr(mStart(i)) & "]  parsed=" & ok1
+        Debug.Print "   Finish raw=[" & CStr(mFin(i)) & "]  parsed=" & ok2
+        Debug.Print "   Preds  raw=[" & mPredRaw(i) & "]"
+    Next i
+
+    For i = 1 To mCount
+        d1 = dpToDate(mStart(i), ok1)
+        d2 = dpToDate(mFin(i), ok2)
+        If Not ok1 Then nBadStart = nBadStart + 1
+        If Not ok2 Then nBadFin = nBadFin + 1
+        If Len(Trim(mPredRaw(i))) = 0 Then nNoPred = nNoPred + 1
+    Next i
+
+    Debug.Print String(66, "-")
+    Debug.Print "Unparseable start dates:  " & nBadStart & " of " & mCount
+    Debug.Print "Unparseable finish dates: " & nBadFin & " of " & mCount
+    Debug.Print "Tasks with no predecessors: " & nNoPred & " of " & mCount
+
+    msg = "Rows loaded: " & mCount & vbCrLf
+    msg = msg & "Unparseable start dates: " & nBadStart & vbCrLf
+    msg = msg & "Unparseable finish dates: " & nBadFin & vbCrLf
+    msg = msg & "Tasks with no predecessors: " & nNoPred & vbCrLf & vbCrLf
+    msg = msg & "Detail is in the Immediate window (Ctrl+G)."
+    MsgBox msg, vbInformation, "Verify Load"
+    Exit Sub
+
+Fail:
+    MsgBox "Verify failed: " & Err.Description, vbExclamation, "Verify Load"
+End Sub
+
+'================================================
 ' LOAD
 '================================================
 Private Sub dpLoadSource()
     Dim ws As Worksheet
     Dim lr As Long
+    Dim lc As Long
     Dim i As Long
+    Dim c As Long
     Dim n As Long
     Dim sID As String
+    Dim hdr As Object
+    Dim k As String
+    Dim cID As Long
+    Dim cNm As Long
+    Dim cDur As Long
+    Dim cSt As Long
+    Dim cFi As Long
+    Dim cPr As Long
 
     Set ws = Nothing
     On Error Resume Next
@@ -273,6 +345,28 @@ Private Sub dpLoadSource()
 
     lr = ws.Cells(ws.Rows.Count, 1).End(xlUp).Row
     If lr <= SRC_HDR_ROW Then dpBail "Sheet " & SRC_SHEET & " has no data rows."
+
+    lc = ws.Cells(SRC_HDR_ROW, ws.Columns.Count).End(xlToLeft).Column
+    Set hdr = CreateObject("Scripting.Dictionary")
+    hdr.CompareMode = 1
+    For c = 1 To lc
+        k = dpNorm(CStr(ws.Cells(SRC_HDR_ROW, c).Value))
+        If Len(k) > 0 Then
+            If Not hdr.Exists(k) Then hdr.Add k, c
+        End If
+    Next c
+
+    cID = dpFindCol(hdr, "taskid|id")
+    cNm = dpFindCol(hdr, "name|taskname")
+    cDur = dpFindCol(hdr, "currentduration|duration")
+    cSt = dpFindCol(hdr, "currentstartdate|currentstart|startdate|start")
+    cFi = dpFindCol(hdr, "currentfinishdate|currentfinish|finishdate|finish")
+    cPr = dpFindCol(hdr, "predecessors|predecessor")
+
+    If cID = 0 Then dpBail "No Task ID column found in row " & SRC_HDR_ROW & " of " & SRC_SHEET
+    If cSt = 0 Then dpBail "No Current Start Date column found on " & SRC_SHEET
+    If cFi = 0 Then dpBail "No Current Finish Date column found on " & SRC_SHEET
+    If cPr = 0 Then dpBail "No Predecessors column found on " & SRC_SHEET
 
     n = lr - SRC_HDR_ROW
     ReDim mIDs(1 To n)
@@ -289,19 +383,19 @@ Private Sub dpLoadSource()
 
     mCount = 0
     For i = SRC_HDR_ROW + 1 To lr
-        sID = Trim(CStr(ws.Cells(i, 1).Value))
+        sID = Trim(CStr(ws.Cells(i, cID).Value))
         If Len(sID) > 0 Then
             mCount = mCount + 1
             mIDs(mCount) = sID
-            mNames(mCount) = CStr(ws.Cells(i, 2).Value)
-            mDur(mCount) = ws.Cells(i, 4).Value
-            mStart(mCount) = ws.Cells(i, 5).Value
-            mFin(mCount) = ws.Cells(i, 6).Value
-            mPredRaw(mCount) = CStr(ws.Cells(i, 6 + 1).Value)
+            If cNm > 0 Then mNames(mCount) = CStr(ws.Cells(i, cNm).Value)
+            If cDur > 0 Then mDur(mCount) = ws.Cells(i, cDur).Value
+            mStart(mCount) = ws.Cells(i, cSt).Value
+            mFin(mCount) = ws.Cells(i, cFi).Value
+            mPredRaw(mCount) = CStr(ws.Cells(i, cPr).Value)
             If Not mDIdx.Exists(sID) Then mDIdx.Add sID, mCount
         End If
     Next i
-    If mCount = 0 Then dpBail "No Task IDs found in column A of " & SRC_SHEET
+    If mCount = 0 Then dpBail "No Task IDs found on " & SRC_SHEET
 End Sub
 
 '================================================
@@ -563,6 +657,32 @@ End Sub
 Private Sub dpBail(ByVal s As String)
     Err.Raise 5, "DrivingPath", s
 End Sub
+
+Private Function dpNorm(ByVal s As String) As String
+    Dim i As Long
+    Dim c As String
+    Dim o As String
+    Dim junk As String
+    junk = " _-.()/\'" & vbTab
+    s = LCase(Trim(s))
+    For i = 1 To Len(s)
+        c = Mid(s, i, 1)
+        If InStr(junk, c) = 0 Then o = o & c
+    Next i
+    dpNorm = o
+End Function
+
+Private Function dpFindCol(ByVal d As Object, ByVal cands As String) As Long
+    Dim a() As String
+    Dim i As Long
+    a = Split(cands, "|")
+    For i = LBound(a) To UBound(a)
+        If d.Exists(a(i)) Then
+            dpFindCol = d(a(i))
+            Exit Function
+        End If
+    Next i
+End Function
 
 Private Function dpLinkLabel(ByVal code As String, ByVal rawType As String, ByVal lagV As Double) As String
     Dim o As String
