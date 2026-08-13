@@ -58,8 +58,8 @@ Public Sub BuildProjectStyleScheduleView()
     Dim outA As Variant
     Dim oldCalc As XlCalculation
     Dim msg As String
-    Dim eNum As Long
-    Dim eDesc As String
+    Dim errNum As Long
+    Dim errDesc As String
 
     ResetState
     oldCalc = Application.Calculation
@@ -280,8 +280,8 @@ Public Sub BuildProjectStyleScheduleView()
     Exit Sub
 
 Fail:
-    eNum = Err.Number
-    eDesc = Err.Description
+    errNum = Err.Number
+    errDesc = Err.Description
     On Error Resume Next
     Application.EnableEvents = True
     Application.Calculation = xlCalculationAutomatic
@@ -289,7 +289,7 @@ Fail:
     Application.DisplayAlerts = True
     On Error GoTo 0
     msg = "Failed while: " & gStep & vbCrLf & vbCrLf
-    msg = msg & "Error " & eNum & ": " & eDesc
+    msg = msg & "Error " & errNum & ": " & errDesc
     MsgBox msg, vbExclamation, "IPMDAR SPD Project View"
 End Sub
 
@@ -579,11 +579,11 @@ Private Function FindColOpt(ByVal d As Object, ByVal cands As String) As Long
     Next i
 End Function
 
-Private Function FindCol(ByVal d As Object, ByVal cands As String, ByVal label As String, ByVal shName As String) As Long
+Private Function FindCol(ByVal d As Object, ByVal cands As String, ByVal colLabel As String, ByVal shName As String) As Long
     Dim msg As String
     FindCol = FindColOpt(d, cands)
     If FindCol = 0 Then
-        msg = "No " & label & " column on sheet " & shName & ". "
+        msg = "No " & colLabel & " column on sheet " & shName & ". "
         msg = msg & "Header row is " & HEADER_ROW & ". Run ShowSheetsAndHeaders."
         Bail msg
     End If
