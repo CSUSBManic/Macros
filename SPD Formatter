@@ -1,16 +1,17 @@
 Option Explicit
 
 '==================== USER SETTINGS ====================
+Private Const HEADER_ROW       As Long    = 2        ' <-- headers live in row 2
 Private Const DEBUG_MODE       As Boolean = False    ' True = break on the failing line
 Private Const LAG_UNIT         As String  = "d"      ' see caveat #1
 Private Const CASE_SENSITIVE_IDS As Boolean = True   ' SPD StringIDs are case-sensitive
 Private Const OUT_SHEET        As String  = "Project View"
 Private Const DIAG_SHEET       As String  = "_View Diagnostics"
 Private Const WRITE_DIAG       As Boolean = True
-Private Const HEADER_ROW       As Long    = 1
 Private Const LIST_SEP         As String  = ", "     ' use "; " for some locales
 Private Const TOKEN_SEP        As String  = vbTab    ' internal delimiter only
 Private Const DIAG_CAP         As Long    = 500
+Private Const MIN_HEADERS      As Long    = 3        ' sanity check on HEADER_ROW
 '=======================================================
 
 Private gStep As String          ' breadcrumb for the error handler
@@ -59,10 +60,10 @@ Public Sub BuildProjectStyleScheduleView()
     gStep = "reading '" & wsTasks.Name & "'": aTasks = ReadBlock(wsTasks)
     gStep = "reading '" & wsRel.Name & "'":   aRel = ReadBlock(wsRel)
 
-    gStep = "reading header rows"
-    Set hTSD = GetHeaders(aTSD)
-    Set hTasks = GetHeaders(aTasks)
-    Set hRel = GetHeaders(aRel)
+    gStep = "reading header row (" & HEADER_ROW & ")"
+    Set hTSD = GetHeaders(aTSD, wsTSD.Name)
+    Set hTasks = GetHeaders(aTasks, wsTasks.Name)
+    Set hRel = GetHeaders(aRel, wsRel.Name)
 
     '--- resolve columns ----------------------------------------------
     gStep = "resolving columns on '" & wsTSD.Name & "'"
@@ -110,7 +111,7 @@ Public Sub BuildProjectStyleScheduleView()
         End If
     Next i
     If n = 0 Then Err.Raise 5, , "No Task IDs found in column " & cTsdID & _
-        " of '" & wsTSD.Name & "'. Is HEADER_ROW correct?"
+        " of '" & wsTSD.Name & "' below row " & HEADER_ROW & "."
 
     '--- build relationship tokens ------------------------------------
     gStep = "parsing relationships"
@@ -166,8 +167,8 @@ Public Sub BuildProjectStyleScheduleView()
     '--- assemble output ----------------------------------------------
     gStep = "assembling output array"
     ReDim outA(1 To n + 1, 1 To 7)
-    outA(1, 1) = "Task ID":            outA(1, 2) = "Name"
-    outA(1, 3) = "Current Duration":   outA(1, 4) = "Current Start Date"
+    outA(1, 1) = "Task ID":             outA(1, 2) = "Name"
+    outA(1, 3) = "Current Duration":    outA(1, 4) = "Current Start Date"
     outA(1, 5) = "Current Finish Date": outA(1, 6) = "Predecessors"
     outA(1, 7) = "Successors"
 
@@ -207,7 +208,7 @@ Public Sub BuildProjectStyleScheduleView()
         .Interior.Color = RGB(221, 235, 247)
     End With
 
-    ' non-fatal cosmetics: these fail (1004) if the window isn't frontmost
+    ' non-fatal cosmetics: these raise 1004 if the window isn't frontmost
     On Error Resume Next
     wsOut.Rows(1).AutoFilter
     wsOut.Activate
@@ -233,6 +234,7 @@ Public Sub BuildProjectStyleScheduleView()
     Application.ScreenUpdating = True
 
     MsgBox "Built '" & OUT_SHEET & "'." & vbCrLf & vbCrLf & _
+           "Header row used:            " & HEADER_ROW & vbCrLf & _
            "Tasks written:              " & n & vbCrLf & _
            "Relationship rows read:     " & nRelRows & vbCrLf & _
            "Lag column found:           " & IIf(cRelL > 0, "yes", "NO - lags omitted") & vbCrLf & _
@@ -270,19 +272,22 @@ Public Sub ResetExcel()
 End Sub
 
 Public Sub ShowSheetsAndHeaders()
-    Dim ws As Worksheet, c As Long, lc As Long, h As String
+    Dim ws As Worksheet, c As Long, lc As Long, rr As Long, h As String
     Debug.Print String(64, "=")
-    Debug.Print "Workbook: " & ThisWorkbook.Name
+    Debug.Print "Workbook: " & ThisWorkbook.Name & "   HEADER_ROW = " & HEADER_ROW
     For Each ws In ThisWorkbook.Worksheets
         Debug.Print String(64, "-")
         Debug.Print "SHEET [" & ws.Name & "]  -> norm: " & Norm(ws.Name)
-        lc = ws.Cells(HEADER_ROW, ws.Columns.Count).End(xlToLeft).Column
-        If lc > 60 Then lc = 60
-        For c = 1 To lc
-            h = CStr(ws.Cells(HEADER_ROW, c).Text)
-            If Len(Trim$(h)) > 0 Then _
-                Debug.Print "   col " & c & ": [" & h & "] -> " & Norm(h)
-        Next c
+        For rr = 1 To 3
+            lc = ws.Cells(rr, ws.Columns.Count).End(xlToLeft).Column
+            If lc > 60 Then lc = 60
+            Debug.Print "  --- row " & rr & IIf(rr = HEADER_ROW, "  <== HEADER_ROW", "")
+            For c = 1 To lc
+                h = CStr(ws.Cells(rr, c).Text)
+                If Len(Trim$(h)) > 0 Then _
+                    Debug.Print "     col " & c & ": [" & h & "] -> " & Norm(h)
+            Next c
+        Next rr
     Next ws
     MsgBox "Written to the Immediate window (Ctrl+G in the VBA editor).", vbInformation
 End Sub
@@ -415,21 +420,27 @@ Private Function ReadBlock(ByVal ws As Worksheet) As Variant
         lc = .Column + .Columns.Count - 1
     End With
     If lr <= HEADER_ROW Then Err.Raise 5, , "Sheet '" & ws.Name & _
-        "' has a header but no data rows."
-    a = ws.Range(ws.Cells(HEADER_ROW, 1), ws.Cells(lr, lc)).Value
+        "' has a header at row " & HEADER_ROW & " but no data rows below it."
+    ' Anchor at row 1 / col 1 so array indices equal worksheet row/column numbers.
+    a = ws.Range(ws.Cells(1, 1), ws.Cells(lr, lc)).Value
     If Not IsArray(a) Then Err.Raise 5, , "Sheet '" & ws.Name & _
         "' returned a single cell rather than a table."
     ReadBlock = a
 End Function
 
-Private Function GetHeaders(ByRef a As Variant) As Object
+Private Function GetHeaders(ByRef a As Variant, ByVal shName As String) As Object
     Dim d As Object, c&, k$
     Set d = CreateObject("Scripting.Dictionary")
     d.CompareMode = 1
+    If UBound(a, 1) < HEADER_ROW Then Err.Raise 5, , "Sheet '" & shName & _
+        "' has fewer than " & HEADER_ROW & " rows; HEADER_ROW is set to " & HEADER_ROW & "."
     For c = LBound(a, 2) To UBound(a, 2)
         k = Norm(NzS(a(HEADER_ROW, c)))
         If Len(k) > 0 Then If Not d.Exists(k) Then d.Add k, c
     Next c
+    If d.Count < MIN_HEADERS Then Err.Raise 5, , "Only " & d.Count & _
+        " header name(s) found in row " & HEADER_ROW & " of '" & shName & _
+        "'. Is HEADER_ROW correct? Run ShowSheetsAndHeaders."
     Set GetHeaders = d
 End Function
 
@@ -470,6 +481,7 @@ Private Sub WriteDiag(dName As Object, dOrph As Object, dType As Object, _
     ws.Range("A1:B1").Font.Bold = True
     r = 2
     ws.Cells(r, 1) = "Run timestamp":              ws.Cells(r, 2) = Now: r = r + 1
+    ws.Cells(r, 1) = "Header row used":            ws.Cells(r, 2) = HEADER_ROW: r = r + 1
     ws.Cells(r, 1) = "Tasks written":              ws.Cells(r, 2) = nTasks: r = r + 1
     ws.Cells(r, 1) = "Relationship rows read":     ws.Cells(r, 2) = nRel: r = r + 1
     ws.Cells(r, 1) = "LagDuration column found":   ws.Cells(r, 2) = IIf(hadLag, "yes", "no"): r = r + 1
@@ -483,7 +495,9 @@ Private Sub WriteDiag(dName As Object, dOrph As Object, dType As Object, _
 
     ws.Cells(r, 1) = "Task IDs with no Name in Tasks (capped " & DIAG_CAP & ")"
     ws.Cells(r, 1).Font.Bold = True: r = r + 1
-    For Each k In dName.Keys: ws.Cells(r, 1).NumberFormat = "@": ws.Cells(r, 1) = k: r = r + 1: Next k
+    For Each k In dName.Keys
+        ws.Cells(r, 1).NumberFormat = "@": ws.Cells(r, 1) = k: r = r + 1
+    Next k
     r = r + 1
     ws.Cells(r, 1) = "Relationship IDs absent from Task Schedule Data"
     ws.Cells(r, 1).Font.Bold = True: r = r + 1
