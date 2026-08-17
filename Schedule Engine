@@ -1,0 +1,789 @@
+Option Explicit
+
+'=================== SETTINGS ===================
+Private Const SRC_SHEET As String = "Project View"
+Private Const SRC_HDR_ROW As Long = 1
+Private Const FS_ADJUST As Double = 1
+Private Const TIE_TOL As Double = 0.0001
+Private Const MAX_DEPTH As Long = 5000
+Private Const SHOW_ALTS As Boolean = True
+'================================================
+
+Private mIDs() As String
+Private mNames() As String
+Private mDur() As Variant
+Private mStart() As Variant
+Private mFin() As Variant
+Private mPredRaw() As String
+Private mCount As Long
+Private mDIdx As Object
+Private mUnparsed As Object
+
+Private tPredID() As String
+Private tCode() As String
+Private tRaw() As String
+Private tLag() As Double
+Private tGap() As Double
+Private tGapOK() As Boolean
+Private tN As Long
+
+Private gPStep As String
+
+'================================================
+' ENTRY POINT
+'================================================
+Public Sub BuildDrivingPathToTask()
+
+    Dim vAns As Variant
+    Dim targetID As String
+    Dim tIdx As Long
+    Dim pathIdx() As Long
+    Dim pathLink() As String
+    Dim pathGap() As Double
+    Dim pathGapOK() As Boolean
+    Dim pathPreds() As Long
+    Dim pathTies() As Long
+    Dim depth As Long
+    Dim curIdx As Long
+    Dim pick As Long
+    Dim i As Long
+    Dim j As Long
+    Dim ws As Worksheet
+    Dim shName As String
+    Dim dSeen As Object
+    Dim stopReason As String
+    Dim msg As String
+    Dim errNum As Long
+    Dim errDesc As String
+    Dim okS As Boolean
+    Dim okF As Boolean
+    Dim dS As Double
+    Dim dF As Double
+    Dim r As Long
+    Dim spanTxt As String
+
+    gPStep = "starting"
+    On Error GoTo Fail
+
+    gPStep = "loading " & SRC_SHEET
+    dpLoadSource
+
+    gPStep = "prompting for Task ID"
+    vAns = Application.InputBox("Enter the Task ID to trace the driving path to:", "Driving Path", "", , , , , 2)
+    If VarType(vAns) = vbBoolean Then Exit Sub
+    targetID = Trim(CStr(vAns))
+    If Len(targetID) = 0 Then Exit Sub
+
+    gPStep = "resolving Task ID"
+    If Not mDIdx.Exists(targetID) Then
+        msg = "Task ID not found on " & SRC_SHEET & ": " & targetID
+        j = dpFindLoose(targetID)
+        If j > 0 Then
+            msg = msg & vbCrLf & vbCrLf & "Closest case-insensitive match: " & mIDs(j)
+        End If
+        MsgBox msg, vbExclamation, "Driving Path"
+        Exit Sub
+    End If
+    tIdx = mDIdx(targetID)
+
+    gPStep = "walking the driving path"
+    ReDim pathIdx(1 To MAX_DEPTH)
+    ReDim pathLink(1 To MAX_DEPTH)
+    ReDim pathGap(1 To MAX_DEPTH)
+    ReDim pathGapOK(1 To MAX_DEPTH)
+    ReDim pathPreds(1 To MAX_DEPTH)
+    ReDim pathTies(1 To MAX_DEPTH)
+    Set dSeen = CreateObject("Scripting.Dictionary")
+    dSeen.CompareMode = 0
+
+    depth = 1
+    curIdx = tIdx
+    pathIdx(1) = curIdx
+    dSeen.Add mIDs(curIdx), 1
+    stopReason = "reached a task with no predecessors"
+
+    Do
+        dpParsePreds curIdx
+        pathPreds(depth) = tN
+        If tN = 0 Then Exit Do
+
+        dpScoreGaps curIdx
+        pick = dpPickDriving(curIdx, pathTies(depth))
+        If pick = 0 Then
+            stopReason = "could not rank predecessors (no usable dates)"
+            Exit Do
+        End If
+
+        pathLink(depth) = dpLinkLabel(tCode(pick), tRaw(pick), tLag(pick))
+        pathGap(depth) = tGap(pick)
+        pathGapOK(depth) = tGapOK(pick)
+
+        If Not mDIdx.Exists(tPredID(pick)) Then
+            stopReason = "driving predecessor " & tPredID(pick) & " is not on " & SRC_SHEET
+            Exit Do
+        End If
+
+        If dSeen.Exists(tPredID(pick)) Then
+            stopReason = "stopped on a circular reference at " & tPredID(pick)
+            Exit Do
+        End If
+
+        curIdx = mDIdx(tPredID(pick))
+        depth = depth + 1
+        If depth > MAX_DEPTH Then
+            stopReason = "hit the MAX_DEPTH limit of " & MAX_DEPTH
+            depth = MAX_DEPTH
+            Exit Do
+        End If
+        pathIdx(depth) = curIdx
+        dSeen.Add mIDs(curIdx), 1
+    Loop
+
+    '--- write output ------------------------------------------
+    gPStep = "writing output sheet"
+    shName = dpSheetName(targetID)
+    Set ws = dpResetSheet(shName)
+
+    dS = dpToDate(mStart(pathIdx(depth)), okS)
+    dF = dpToDate(mFin(tIdx), okF)
+    spanTxt = "not computable"
+    If okS Then
+        If okF Then
+            spanTxt = CStr(dF - dS) & " calendar days"
+        End If
+    End If
+
+    ws.Range("A1").Value = "Driving path to"
+    ws.Range("B1").NumberFormat = "@"
+    ws.Range("B1").Value = targetID
+    ws.Range("A2").Value = "Task name"
+    ws.Range("B2").Value = mNames(tIdx)
+    ws.Range("A3").Value = "Steps in path"
+    ws.Range("B3").Value = depth
+    ws.Range("A4").Value = "Chain start"
+    ws.Range("B4").NumberFormat = "@"
+    ws.Range("B4").Value = mIDs(pathIdx(depth))
+    ws.Range("A5").Value = "Walk terminated because"
+    ws.Range("B5").Value = stopReason
+    ws.Range("A6").Value = "Span, first start to target finish"
+    ws.Range("B6").Value = spanTxt
+    ws.Range("A7").Value = "Source sheet"
+    ws.Range("B7").Value = SRC_SHEET
+    ws.Range("A8").Value = "Generated"
+    ws.Range("B8").Value = CStr(Now)
+    ws.Range("A1:A8").Font.Bold = True
+
+    ws.Range("A10").Value = "Step"
+    ws.Range("B10").Value = "Task ID"
+    ws.Range("C10").Value = "Name"
+    ws.Range("D10").Value = "Current Duration"
+    ws.Range("E10").Value = "Current Start Date"
+    ws.Range("F10").Value = "Current Finish Date"
+    ws.Range("G10").Value = "Link into next row"
+    ws.Range("H10").Value = "Gap, cal days"
+    ws.Range("I10").Value = "Preds on this task"
+    ws.Range("J10").Value = "Tied drivers"
+    ws.Range("A10:J10").Font.Bold = True
+    ws.Range("A10:J10").Interior.Color = RGB(221, 235, 247)
+
+    ws.Range("B:B").NumberFormat = "@"
+    ws.Range("G:G").NumberFormat = "@"
+
+    r = 11
+    For i = depth To 1 Step -1
+        j = pathIdx(i)
+        ws.Cells(r, 1).Value = depth - i + 1
+        ws.Cells(r, 2).Value = mIDs(j)
+        ws.Cells(r, 3).Value = mNames(j)
+        ws.Cells(r, 4).Value = mDur(j)
+        ws.Cells(r, 5).Value = mStart(j)
+        ws.Cells(r, 6).Value = mFin(j)
+        If i > 1 Then
+            ws.Cells(r, 7).Value = pathLink(i)
+            If pathGapOK(i) Then
+                ws.Cells(r, 8).Value = pathGap(i)
+            Else
+                ws.Cells(r, 8).Value = "n/a"
+            End If
+        Else
+            ws.Cells(r, 7).Value = "TARGET"
+        End If
+        ws.Cells(r, 9).Value = pathPreds(i)
+        ws.Cells(r, 10).Value = pathTies(i)
+        r = r + 1
+    Next i
+
+    ws.Range("E11").Resize(depth, 2).NumberFormat = "yyyy-mm-dd"
+
+    If SHOW_ALTS Then
+        gPStep = "writing alternatives block"
+        dpWriteAlternatives ws, r + 1, pathIdx, depth
+    End If
+
+    If mUnparsed.Count > 0 Then
+        gPStep = "writing unparsed token list"
+        r = ws.Cells(ws.Rows.Count, 1).End(xlUp).Row + 2
+        ws.Cells(r, 1).Value = "Predecessor tokens that could not be parsed"
+        ws.Cells(r, 1).Font.Bold = True
+        r = r + 1
+        For Each vAns In mUnparsed.Keys
+            ws.Cells(r, 1).NumberFormat = "@"
+            ws.Cells(r, 1).Value = vAns
+            r = r + 1
+        Next vAns
+    End If
+
+    On Error Resume Next
+    ws.Columns("A:J").AutoFit
+    If ws.Columns("C").ColumnWidth > 55 Then ws.Columns("C").ColumnWidth = 55
+    If ws.Columns("B").ColumnWidth > 30 Then ws.Columns("B").ColumnWidth = 30
+    ws.Activate
+    ws.Range("A11").Select
+    On Error GoTo 0
+
+    msg = "Driving path written to sheet: " & shName & vbCrLf & vbCrLf
+    msg = msg & "Target: " & targetID & vbCrLf
+    msg = msg & "Steps in path: " & depth & vbCrLf
+    msg = msg & "Chain start: " & mIDs(pathIdx(depth)) & vbCrLf
+    msg = msg & "Stopped because: " & stopReason & vbCrLf
+    msg = msg & "Unparsed pred tokens: " & mUnparsed.Count
+    MsgBox msg, vbInformation, "Driving Path"
+    Exit Sub
+
+Fail:
+    errNum = Err.Number
+    errDesc = Err.Description
+    msg = "Failed while: " & gPStep & vbCrLf & vbCrLf
+    msg = msg & "Error " & errNum & ": " & errDesc
+    MsgBox msg, vbExclamation, "Driving Path"
+End Sub
+
+'================================================
+' VERIFICATION
+'================================================
+Public Sub VerifyProjectViewLoad()
+    Dim i As Long
+    Dim n As Long
+    Dim ok1 As Boolean
+    Dim ok2 As Boolean
+    Dim d1 As Double
+    Dim d2 As Double
+    Dim nBadStart As Long
+    Dim nBadFin As Long
+    Dim nNoPred As Long
+    Dim msg As String
+
+    On Error GoTo Fail
+    dpLoadSource
+
+    Debug.Print String(66, "=")
+    Debug.Print "VerifyProjectViewLoad"
+    Debug.Print "Rows loaded: " & mCount
+    Debug.Print String(66, "-")
+
+    n = 5
+    If mCount < n Then n = mCount
+    For i = 1 To n
+        d1 = dpToDate(mStart(i), ok1)
+        d2 = dpToDate(mFin(i), ok2)
+        Debug.Print "ID=[" & mIDs(i) & "]  Name=[" & Left(mNames(i), 34) & "]"
+        Debug.Print "   Start  raw=[" & CStr(mStart(i)) & "]  parsed=" & ok1
+        Debug.Print "   Finish raw=[" & CStr(mFin(i)) & "]  parsed=" & ok2
+        Debug.Print "   Preds  raw=[" & mPredRaw(i) & "]"
+    Next i
+
+    For i = 1 To mCount
+        d1 = dpToDate(mStart(i), ok1)
+        d2 = dpToDate(mFin(i), ok2)
+        If Not ok1 Then nBadStart = nBadStart + 1
+        If Not ok2 Then nBadFin = nBadFin + 1
+        If Len(Trim(mPredRaw(i))) = 0 Then nNoPred = nNoPred + 1
+    Next i
+
+    Debug.Print String(66, "-")
+    Debug.Print "Unparseable start dates:  " & nBadStart & " of " & mCount
+    Debug.Print "Unparseable finish dates: " & nBadFin & " of " & mCount
+    Debug.Print "Tasks with no predecessors: " & nNoPred & " of " & mCount
+
+    msg = "Rows loaded: " & mCount & vbCrLf
+    msg = msg & "Unparseable start dates: " & nBadStart & vbCrLf
+    msg = msg & "Unparseable finish dates: " & nBadFin & vbCrLf
+    msg = msg & "Tasks with no predecessors: " & nNoPred & vbCrLf & vbCrLf
+    msg = msg & "Detail is in the Immediate window (Ctrl+G)."
+    MsgBox msg, vbInformation, "Verify Load"
+    Exit Sub
+
+Fail:
+    MsgBox "Verify failed: " & Err.Description, vbExclamation, "Verify Load"
+End Sub
+
+'================================================
+' LOAD
+'================================================
+Private Sub dpLoadSource()
+    Dim ws As Worksheet
+    Dim lr As Long
+    Dim lc As Long
+    Dim i As Long
+    Dim c As Long
+    Dim n As Long
+    Dim sID As String
+    Dim hdr As Object
+    Dim k As String
+    Dim cID As Long
+    Dim cNm As Long
+    Dim cDur As Long
+    Dim cSt As Long
+    Dim cFi As Long
+    Dim cPr As Long
+
+    Set ws = Nothing
+    On Error Resume Next
+    Set ws = ThisWorkbook.Worksheets(SRC_SHEET)
+    On Error GoTo 0
+    If ws Is Nothing Then dpBail "Cannot find the sheet named " & SRC_SHEET & ". Run the builder macro first."
+
+    lr = ws.Cells(ws.Rows.Count, 1).End(xlUp).Row
+    If lr <= SRC_HDR_ROW Then dpBail "Sheet " & SRC_SHEET & " has no data rows."
+
+    lc = ws.Cells(SRC_HDR_ROW, ws.Columns.Count).End(xlToLeft).Column
+    Set hdr = CreateObject("Scripting.Dictionary")
+    hdr.CompareMode = 1
+    For c = 1 To lc
+        k = dpNorm(CStr(ws.Cells(SRC_HDR_ROW, c).Value))
+        If Len(k) > 0 Then
+            If Not hdr.Exists(k) Then hdr.Add k, c
+        End If
+    Next c
+
+    cID = dpFindCol(hdr, "taskid|id")
+    cNm = dpFindCol(hdr, "name|taskname")
+    cDur = dpFindCol(hdr, "currentduration|duration")
+    cSt = dpFindCol(hdr, "currentstartdate|currentstart|startdate|start")
+    cFi = dpFindCol(hdr, "currentfinishdate|currentfinish|finishdate|finish")
+    cPr = dpFindCol(hdr, "predecessors|predecessor")
+
+    If cID = 0 Then dpBail "No Task ID column found in row " & SRC_HDR_ROW & " of " & SRC_SHEET
+    If cSt = 0 Then dpBail "No Current Start Date column found on " & SRC_SHEET
+    If cFi = 0 Then dpBail "No Current Finish Date column found on " & SRC_SHEET
+    If cPr = 0 Then dpBail "No Predecessors column found on " & SRC_SHEET
+
+    n = lr - SRC_HDR_ROW
+    ReDim mIDs(1 To n)
+    ReDim mNames(1 To n)
+    ReDim mDur(1 To n)
+    ReDim mStart(1 To n)
+    ReDim mFin(1 To n)
+    ReDim mPredRaw(1 To n)
+
+    Set mDIdx = CreateObject("Scripting.Dictionary")
+    mDIdx.CompareMode = 0
+    Set mUnparsed = CreateObject("Scripting.Dictionary")
+    mUnparsed.CompareMode = 0
+
+    mCount = 0
+    For i = SRC_HDR_ROW + 1 To lr
+        sID = Trim(CStr(ws.Cells(i, cID).Value))
+        If Len(sID) > 0 Then
+            mCount = mCount + 1
+            mIDs(mCount) = sID
+            If cNm > 0 Then mNames(mCount) = CStr(ws.Cells(i, cNm).Value)
+            If cDur > 0 Then mDur(mCount) = ws.Cells(i, cDur).Value
+            mStart(mCount) = ws.Cells(i, cSt).Value
+            mFin(mCount) = ws.Cells(i, cFi).Value
+            mPredRaw(mCount) = CStr(ws.Cells(i, cPr).Value)
+            If Not mDIdx.Exists(sID) Then mDIdx.Add sID, mCount
+        End If
+    Next i
+    If mCount = 0 Then dpBail "No Task IDs found on " & SRC_SHEET
+End Sub
+
+'================================================
+' PARSE PREDECESSOR TOKENS
+'================================================
+Private Sub dpParsePreds(ByVal idx As Long)
+    Dim raw As String
+    Dim toks() As String
+    Dim i As Long
+    Dim t As String
+    Dim pid As String
+    Dim rest As String
+    Dim code As String
+    Dim rawType As String
+    Dim lagV As Double
+    Dim p As Long
+
+    tN = 0
+    ReDim tPredID(1 To 1)
+    ReDim tCode(1 To 1)
+    ReDim tRaw(1 To 1)
+    ReDim tLag(1 To 1)
+    ReDim tGap(1 To 1)
+    ReDim tGapOK(1 To 1)
+
+    raw = Trim(mPredRaw(idx))
+    If Len(raw) = 0 Then Exit Sub
+
+    toks = Split(raw, ",")
+    ReDim tPredID(1 To UBound(toks) + 1)
+    ReDim tCode(1 To UBound(toks) + 1)
+    ReDim tRaw(1 To UBound(toks) + 1)
+    ReDim tLag(1 To UBound(toks) + 1)
+    ReDim tGap(1 To UBound(toks) + 1)
+    ReDim tGapOK(1 To UBound(toks) + 1)
+
+    For i = LBound(toks) To UBound(toks)
+        t = Trim(toks(i))
+        If Len(t) > 0 Then
+            pid = dpLongestKnownID(t)
+            If Len(pid) = 0 Then
+                If mUnparsed.Count < 200 Then
+                    If Not mUnparsed.Exists(t) Then mUnparsed.Add t, 1
+                End If
+            Else
+                rest = Mid(t, Len(pid) + 1)
+                code = "FS"
+                rawType = ""
+                If Len(rest) > 0 Then
+                    If Left(rest, 1) = "[" Then
+                        p = InStr(rest, "]")
+                        If p > 0 Then
+                            rawType = Mid(rest, 2, p - 2)
+                            code = "??"
+                            rest = Mid(rest, p + 1)
+                        End If
+                    ElseIf Len(rest) >= 2 Then
+                        Select Case UCase(Left(rest, 2))
+                            Case "FS", "SS", "FF", "SF"
+                                code = UCase(Left(rest, 2))
+                                rest = Mid(rest, 3)
+                        End Select
+                    End If
+                End If
+                lagV = dpParseLag(rest)
+                tN = tN + 1
+                tPredID(tN) = pid
+                tCode(tN) = code
+                tRaw(tN) = rawType
+                tLag(tN) = lagV
+            End If
+        End If
+    Next i
+End Sub
+
+Private Function dpLongestKnownID(ByVal t As String) As String
+    Dim L As Long
+    Dim cand As String
+    For L = Len(t) To 1 Step -1
+        cand = Left(t, L)
+        If mDIdx.Exists(cand) Then
+            dpLongestKnownID = cand
+            Exit Function
+        End If
+    Next L
+End Function
+
+Private Function dpParseLag(ByVal s As String) As Double
+    Dim i As Long
+    Dim c As String
+    Dim o As String
+    s = Trim(s)
+    If Len(s) = 0 Then Exit Function
+    s = Replace(s, ",", ".")
+    For i = 1 To Len(s)
+        c = Mid(s, i, 1)
+        If InStr("0123456789.+-", c) > 0 Then
+            o = o & c
+        Else
+            Exit For
+        End If
+    Next i
+    If Len(o) = 0 Then Exit Function
+    dpParseLag = Val(o)
+End Function
+
+'================================================
+' GAP SCORING
+'================================================
+Private Sub dpScoreGaps(ByVal idx As Long)
+    Dim i As Long
+    Dim pIdx As Long
+    Dim okRef As Boolean
+    Dim okSrc As Boolean
+    Dim refD As Double
+    Dim srcD As Double
+    Dim adj As Double
+
+    For i = 1 To tN
+        tGapOK(i) = False
+        tGap(i) = 0
+        If mDIdx.Exists(tPredID(i)) Then
+            pIdx = mDIdx(tPredID(i))
+            adj = 0
+            Select Case tCode(i)
+                Case "FS"
+                    refD = dpToDate(mStart(idx), okRef)
+                    srcD = dpToDate(mFin(pIdx), okSrc)
+                    adj = FS_ADJUST
+                Case "SS"
+                    refD = dpToDate(mStart(idx), okRef)
+                    srcD = dpToDate(mStart(pIdx), okSrc)
+                Case "FF"
+                    refD = dpToDate(mFin(idx), okRef)
+                    srcD = dpToDate(mFin(pIdx), okSrc)
+                Case "SF"
+                    refD = dpToDate(mFin(idx), okRef)
+                    srcD = dpToDate(mStart(pIdx), okSrc)
+                Case Else
+                    refD = dpToDate(mStart(idx), okRef)
+                    srcD = dpToDate(mFin(pIdx), okSrc)
+                    adj = FS_ADJUST
+            End Select
+            If okRef Then
+                If okSrc Then
+                    tGap(i) = refD - (srcD + tLag(i) + adj)
+                    tGapOK(i) = True
+                End If
+            End If
+        End If
+    Next i
+End Sub
+
+Private Function dpPickDriving(ByVal idx As Long, ByRef ties As Long) As Long
+    Dim i As Long
+    Dim best As Long
+    Dim bestGap As Double
+    Dim anyOK As Boolean
+    Dim latest As Double
+    Dim okSrc As Boolean
+    Dim srcD As Double
+    Dim pIdx As Long
+
+    ties = 0
+    anyOK = False
+    For i = 1 To tN
+        If tGapOK(i) Then
+            If Not anyOK Then
+                anyOK = True
+                bestGap = tGap(i)
+                best = i
+            ElseIf tGap(i) < bestGap - TIE_TOL Then
+                bestGap = tGap(i)
+                best = i
+            End If
+        End If
+    Next i
+
+    If anyOK Then
+        For i = 1 To tN
+            If tGapOK(i) Then
+                If Abs(tGap(i) - bestGap) <= TIE_TOL Then ties = ties + 1
+            End If
+        Next i
+        If ties > 0 Then ties = ties - 1
+        dpPickDriving = best
+        Exit Function
+    End If
+
+    latest = -1E+30
+    For i = 1 To tN
+        If mDIdx.Exists(tPredID(i)) Then
+            pIdx = mDIdx(tPredID(i))
+            srcD = dpToDate(mFin(pIdx), okSrc)
+            If okSrc Then
+                If srcD > latest Then
+                    latest = srcD
+                    dpPickDriving = i
+                End If
+            End If
+        End If
+    Next i
+End Function
+
+'================================================
+' ALTERNATIVES BLOCK
+'================================================
+Private Sub dpWriteAlternatives(ByVal ws As Worksheet, ByVal startRow As Long, ByRef pathIdx() As Long, ByVal depth As Long)
+    Dim i As Long
+    Dim j As Long
+    Dim r As Long
+    Dim tgt As Long
+
+    r = startRow
+    ws.Cells(r, 1).Value = "All predecessors of each task on the path, ranked by gap"
+    ws.Cells(r, 1).Font.Bold = True
+    r = r + 1
+    ws.Cells(r, 1).Value = "Path task"
+    ws.Cells(r, 2).Value = "Predecessor"
+    ws.Cells(r, 3).Value = "Pred name"
+    ws.Cells(r, 4).Value = "Link"
+    ws.Cells(r, 5).Value = "Gap, cal days"
+    ws.Cells(r, 6).Value = "On driving path"
+    ws.Range(ws.Cells(r, 1), ws.Cells(r, 6)).Font.Bold = True
+    r = r + 1
+
+    For i = depth To 1 Step -1
+        tgt = pathIdx(i)
+        dpParsePreds tgt
+        dpScoreGaps tgt
+        For j = 1 To tN
+            ws.Cells(r, 1).NumberFormat = "@"
+            ws.Cells(r, 1).Value = mIDs(tgt)
+            ws.Cells(r, 2).NumberFormat = "@"
+            ws.Cells(r, 2).Value = tPredID(j)
+            If mDIdx.Exists(tPredID(j)) Then
+                ws.Cells(r, 3).Value = mNames(mDIdx(tPredID(j)))
+            Else
+                ws.Cells(r, 3).Value = "not on " & SRC_SHEET
+            End If
+            ws.Cells(r, 4).NumberFormat = "@"
+            ws.Cells(r, 4).Value = dpLinkLabel(tCode(j), tRaw(j), tLag(j))
+            If tGapOK(j) Then
+                ws.Cells(r, 5).Value = tGap(j)
+            Else
+                ws.Cells(r, 5).Value = "n/a"
+            End If
+            If i > 1 Then
+                If tPredID(j) = mIDs(pathIdx(i - 1)) Then ws.Cells(r, 6).Value = "yes"
+            End If
+            r = r + 1
+        Next j
+    Next i
+End Sub
+
+'================================================
+' HELPERS
+'================================================
+Private Sub dpBail(ByVal s As String)
+    Err.Raise 5, "DrivingPath", s
+End Sub
+
+Private Function dpNorm(ByVal s As String) As String
+    Dim i As Long
+    Dim c As String
+    Dim o As String
+    Dim junk As String
+    junk = " _-.()/\'" & vbTab
+    s = LCase(Trim(s))
+    For i = 1 To Len(s)
+        c = Mid(s, i, 1)
+        If InStr(junk, c) = 0 Then o = o & c
+    Next i
+    dpNorm = o
+End Function
+
+Private Function dpFindCol(ByVal d As Object, ByVal cands As String) As Long
+    Dim a() As String
+    Dim i As Long
+    a = Split(cands, "|")
+    For i = LBound(a) To UBound(a)
+        If d.Exists(a(i)) Then
+            dpFindCol = d(a(i))
+            Exit Function
+        End If
+    Next i
+End Function
+
+Private Function dpLinkLabel(ByVal code As String, ByVal rawType As String, ByVal lagV As Double) As String
+    Dim o As String
+    If code = "??" Then
+        o = "[" & rawType & "]"
+    Else
+        o = code
+    End If
+    If lagV > 0 Then
+        o = o & "+" & Format(lagV, "0.##")
+    ElseIf lagV < 0 Then
+        o = o & "-" & Format(Abs(lagV), "0.##")
+    End If
+    dpLinkLabel = o
+End Function
+
+Private Function dpToDate(ByVal v As Variant, ByRef ok As Boolean) As Double
+    Dim parts() As String
+    Dim s As String
+    ok = False
+    On Error Resume Next
+    If IsError(v) Then GoTo Done
+    If IsNull(v) Then GoTo Done
+    If IsEmpty(v) Then GoTo Done
+    If IsDate(v) Then
+        dpToDate = CDbl(CDate(v))
+        ok = True
+        GoTo Done
+    End If
+    If IsNumeric(v) Then
+        If CDbl(v) > 0 Then
+            dpToDate = CDbl(v)
+            ok = True
+        End If
+        GoTo Done
+    End If
+    s = Trim(CStr(v))
+    If Len(s) = 0 Then GoTo Done
+    If InStr(s, "-") > 0 Then
+        parts = Split(Left(s, 10), "-")
+        If UBound(parts) = 2 Then
+            If IsNumeric(parts(0)) Then
+                If IsNumeric(parts(1)) Then
+                    If IsNumeric(parts(2)) Then
+                        dpToDate = CDbl(DateSerial(CLng(parts(0)), CLng(parts(1)), CLng(parts(2))))
+                        ok = True
+                        GoTo Done
+                    End If
+                End If
+            End If
+        End If
+    End If
+    dpToDate = CDbl(CDate(s))
+    If Err.Number = 0 Then ok = True
+Done:
+    Err.Clear
+    On Error GoTo 0
+End Function
+
+Private Function dpFindLoose(ByVal s As String) As Long
+    Dim i As Long
+    For i = 1 To mCount
+        If StrComp(mIDs(i), s, vbTextCompare) = 0 Then
+            dpFindLoose = i
+            Exit Function
+        End If
+    Next i
+End Function
+
+Private Function dpSheetName(ByVal targetID As String) As String
+    Dim bad As String
+    Dim i As Long
+    Dim c As String
+    Dim o As String
+    Dim nm As String
+    bad = ":\/?*[]"
+    For i = 1 To Len(targetID)
+        c = Mid(targetID, i, 1)
+        If InStr(bad, c) > 0 Then
+            o = o & "-"
+        Else
+            o = o & c
+        End If
+    Next i
+    nm = "Path to " & o
+    If Len(nm) > 31 Then nm = Left(nm, 31)
+    nm = Trim(nm)
+    If Len(nm) = 0 Then nm = "Path"
+    dpSheetName = nm
+End Function
+
+Private Function dpResetSheet(ByVal nm As String) As Worksheet
+    Dim ws As Worksheet
+    Dim cnt As Long
+    Application.DisplayAlerts = False
+    On Error Resume Next
+    ThisWorkbook.Worksheets(nm).Delete
+    On Error GoTo 0
+    Application.DisplayAlerts = True
+    cnt = ThisWorkbook.Worksheets.Count
+    Set ws = ThisWorkbook.Worksheets.Add(, ThisWorkbook.Worksheets(cnt))
+    ws.Name = nm
+    Set dpResetSheet = ws
+End Function
