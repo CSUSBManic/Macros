@@ -5,6 +5,8 @@ Option Explicit
 '  Copies Start / Finish dates from "Current Month Data" onto
 '  "CEI ASOT", matched on Task ID.
 '
+'  Always appends two NEW columns; never overwrites existing ones.
+'
 '  Entry point:  AddCurrentMonthDates
 '======================================================================
 
@@ -12,9 +14,10 @@ Option Explicit
 Public Const MM_TGT_SHEET      As String = "CEI ASOT"
 Public Const MM_SRC_SHEET      As String = "Current Month Data"
 Public Const MM_HEADER_ROW     As Long = 1
-Public Const MM_START_HDR      As String = "Current Start Date"
-Public Const MM_FINISH_HDR     As String = "Current Finish Date"
+Public Const MM_START_HDR      As String = "Current Month Start"
+Public Const MM_FINISH_HDR     As String = "Current Month Finish"
 Public Const MM_DATE_FMT       As String = "dd-mmm-yyyy"
+Public Const MM_MIN_COL_WIDTH  As Double = 13
 Public Const MM_CASE_SENSITIVE As Boolean = False
 Public Const MM_LOOSE_MATCH    As Boolean = False
 Public Const MM_FLAG_UNMATCHED As Boolean = True
@@ -35,6 +38,7 @@ Public mSrcRows     As Long
 Public mSrcDup      As Long
 Public mSrcConflict As Long
 Public mNonDate     As Long
+Public mDupHdr      As Long
 Public mDDup        As Collection
 Public mDLoose      As Collection
 Public mDUnmatched  As Collection
@@ -115,9 +119,11 @@ Public Sub AddCurrentMonthDates()
     colSF = MMFindCol(hS, "Finish|Finish Date|Current Finish Date|End Date|Actual Finish|Planned Finish", _
                       "Finish date", wsS.Name)
 
+    '---------------- create the two new columns ----------------------
+    mStep = "adding output columns"
     lastColT = UBound(arrT, 2)
-    colOutS = MMEnsureCol(wsT, hT, MM_START_HDR, lastColT)
-    colOutF = MMEnsureCol(wsT, hT, MM_FINISH_HDR, lastColT)
+    colOutS = MMAddCol(wsT, hT, MM_START_HDR, lastColT)
+    colOutF = MMAddCol(wsT, hT, MM_FINISH_HDR, lastColT)
     MMStyleHeader wsT.Cells(MM_HEADER_ROW, colOutS)
     MMStyleHeader wsT.Cells(MM_HEADER_ROW, colOutF)
 
@@ -260,6 +266,9 @@ NextTgt:
         .HorizontalAlignment = xlCenter
     End With
 
+    MMFitCol wsT, colOutS
+    MMFitCol wsT, colOutF
+
     '---------------- shade the problem rows --------------------------
     If MM_FLAG_UNMATCHED Then
         mStep = "flagging exceptions"
@@ -299,8 +308,9 @@ NextTgt:
     Application.EnableEvents = True
     Application.ScreenUpdating = True
 
-    msg = "Dates written to columns " & MMColL(colOutS) & " and " & MMColL(colOutF) & _
-          " on " & wsT.Name & "." & vbCrLf & vbCrLf & _
+    msg = "Created two new columns on " & wsT.Name & ":" & vbCrLf & _
+          "  " & MMColL(colOutS) & " - " & MM_START_HDR & vbCrLf & _
+          "  " & MMColL(colOutF) & " - " & MM_FINISH_HDR & vbCrLf & vbCrLf & _
           "Tasks scanned:  " & mScanned & vbCrLf & _
           "Matched:        " & mExact & IIf(mLoose > 0, " (+" & mLoose & " loose)", "") & vbCrLf & _
           "Not found:      " & mUnmatched & vbCrLf & _
@@ -310,6 +320,10 @@ NextTgt:
     If mSrcDup > 0 Then msg = msg & vbCrLf & "Duplicate source IDs: " & mSrcDup & _
                                     " (" & mSrcConflict & " conflicting)"
     If mNonDate > 0 Then msg = msg & vbCrLf & "Non-date values copied as-is: " & mNonDate
+    If mDupHdr > 0 Then msg = msg & vbCrLf & vbCrLf & _
+                              "Note: " & mDupHdr & " column(s) with these titles already " & _
+                              "existed on " & wsT.Name & ". The old ones were left untouched, " & _
+                              "so the sheet now has more than one."
     If MM_WRITE_DIAG Then msg = msg & vbCrLf & vbCrLf & "Detail on the '" & MM_DIAG_SHEET & "' sheet."
 
     MsgBox msg, vbInformation, "Current Month dates"
@@ -337,6 +351,7 @@ Public Sub MMReset()
     mScanned = 0: mExact = 0: mLoose = 0: mUnmatched = 0
     mAmbiguous = 0: mNoDates = 0: mBlankID = 0
     mSrcRows = 0: mSrcDup = 0: mSrcConflict = 0: mNonDate = 0
+    mDupHdr = 0
     Set mDDup = New Collection
     Set mDLoose = New Collection
     Set mDUnmatched = New Collection
@@ -432,19 +447,29 @@ Public Function MMNewDict(ByVal caseSensitive As Boolean) As Object
     Set MMNewDict = d
 End Function
 
-Public Function MMEnsureCol(ws As Worksheet, h As Object, _
-                            ByVal hdr As String, ByRef lastCol As Long) As Long
+'--- always appends a brand-new column; never reuses an existing one ---
+Public Function MMAddCol(ws As Worksheet, h As Object, _
+                         ByVal hdr As String, ByRef lastCol As Long) As Long
     Dim k As String
     k = MMKey(hdr)
-    If h.Exists(k) Then
-        MMEnsureCol = h(k)
-    Else
-        lastCol = lastCol + 1
-        ws.Cells(MM_HEADER_ROW, lastCol).Value = hdr
-        h.Add k, lastCol
-        MMEnsureCol = lastCol
+    If h.Exists(k) Then mDupHdr = mDupHdr + 1
+    lastCol = lastCol + 1
+    If lastCol > ws.Columns.Count Then
+        MMBail "No room left on " & ws.Name & " - the sheet already reaches the last column."
     End If
+    ws.Cells(MM_HEADER_ROW, lastCol).Value = hdr
+    If Not h.Exists(k) Then h.Add k, lastCol
+    MMAddCol = lastCol
 End Function
+
+Public Sub MMFitCol(ws As Worksheet, ByVal c As Long)
+    On Error Resume Next
+    ws.Columns(c).AutoFit
+    If ws.Columns(c).ColumnWidth < MM_MIN_COL_WIDTH Then
+        ws.Columns(c).ColumnWidth = MM_MIN_COL_WIDTH
+    End If
+    On Error GoTo 0
+End Sub
 
 Public Function MMCleanID(ByVal v As Variant) As String
     Dim s As String
@@ -568,8 +593,8 @@ Public Sub MMWriteDiag(ByVal tgtName As String, ByVal srcName As String, _
 
     wsD.Cells(r, 1).Value = "Target sheet":              wsD.Cells(r, 2).Value = tgtName:      r = r + 1
     wsD.Cells(r, 1).Value = "Source sheet":              wsD.Cells(r, 2).Value = srcName:      r = r + 1
-    wsD.Cells(r, 1).Value = "Start column written":      wsD.Cells(r, 2).Value = MMColL(colS): r = r + 1
-    wsD.Cells(r, 1).Value = "Finish column written":     wsD.Cells(r, 2).Value = MMColL(colF): r = r + 2
+    wsD.Cells(r, 1).Value = MM_START_HDR & " column":    wsD.Cells(r, 2).Value = MMColL(colS): r = r + 1
+    wsD.Cells(r, 1).Value = MM_FINISH_HDR & " column":   wsD.Cells(r, 2).Value = MMColL(colF): r = r + 2
 
     wsD.Cells(r, 1).Value = "Tasks scanned":             wsD.Cells(r, 2).Value = mScanned:     r = r + 1
     wsD.Cells(r, 1).Value = "Matched exactly":           wsD.Cells(r, 2).Value = mExact:       r = r + 1
@@ -581,7 +606,8 @@ Public Sub MMWriteDiag(ByVal tgtName As String, ByVal srcName As String, _
     wsD.Cells(r, 1).Value = "Source rows indexed":       wsD.Cells(r, 2).Value = mSrcRows:     r = r + 1
     wsD.Cells(r, 1).Value = "Duplicate source IDs":      wsD.Cells(r, 2).Value = mSrcDup:      r = r + 1
     wsD.Cells(r, 1).Value = "  of which conflicting":    wsD.Cells(r, 2).Value = mSrcConflict: r = r + 1
-    wsD.Cells(r, 1).Value = "Non-date values copied":    wsD.Cells(r, 2).Value = mNonDate:     r = r + 2
+    wsD.Cells(r, 1).Value = "Non-date values copied":    wsD.Cells(r, 2).Value = mNonDate:     r = r + 1
+    wsD.Cells(r, 1).Value = "Pre-existing same titles":  wsD.Cells(r, 2).Value = mDupHdr:      r = r + 2
 
     MMDiagDump wsD, r, "Unmatched Task IDs", mDUnmatched
     MMDiagDump wsD, r, "Duplicate IDs in " & srcName, mDDup
