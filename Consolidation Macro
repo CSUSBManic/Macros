@@ -1,0 +1,548 @@
+Option Explicit
+
+'=================== SETTINGS ===================
+Private Const MM_TGT_SHEET As String = "CEI ASOT"
+Private Const MM_SRC_SHEET As String = "Current Month Data"
+Private Const MM_HEADER_ROW As Long = 1
+Private Const MM_START_HDR As String = "Current Month Start"
+Private Const MM_FINISH_HDR As String = "Current Month Finish"
+Private Const MM_DATE_FMT As String = "yyyy-mm-dd"
+Private Const MM_CASE_SENSITIVE As Boolean = True
+Private Const MM_LOOSE_MATCH As Boolean = True
+Private Const MM_FLAG_UNMATCHED As Boolean = True
+Private Const MM_WRITE_DIAG As Boolean = True
+Private Const MM_DIAG_SHEET As String = "_Match Diagnostics"
+Private Const MM_DIAG_CAP As Long = 500
+'================================================
+
+Private mStep As String
+Private mScanned As Long
+Private mExact As Long
+Private mLoose As Long
+Private mUnmatched As Long
+Private mBlankID As Long
+Private mSrcRows As Long
+Private mSrcDup As Long
+Private mSrcConflict As Long
+Private mAmbiguous As Long
+Private mNoDates As Long
+Private mNonDate As Long
+Private mDUnmatched As Object
+Private mDLoose As Object
+Private mDDup As Object
+
+'================================================
+' MAIN
+'================================================
+Public Sub AddCurrentMonthDates()
+
+    Dim wsT As Worksheet
+    Dim wsS As Worksheet
+    Dim aT As Variant
+    Dim aS As Variant
+    Dim hT As Object
+    Dim hS As Object
+    Dim dEx As Object
+    Dim dLoose As Object
+    Dim cTid As Long
+    Dim cSid As Long, cSs As Long, cSf As Long
+    Dim cNewS As Long, cNewF As Long
+    Dim lcT As Long
+    Dim nRows As Long
+    Dim i As Long, k As Long, srcRow As Long
+    Dim sID As String, sNorm As String
+    Dim outS As Variant
+    Dim outF As Variant
+    Dim hit As Boolean
+    Dim oldCalc As XlCalculation
+    Dim msg As String
+    Dim errNum As Long
+    Dim errDesc As String
+
+    MMReset
+    oldCalc = Application.Calculation
+    On Error GoTo Fail
+
+    Application.ScreenUpdating = False
+    Application.Calculation = xlCalculationManual
+    Application.EnableEvents = False
+
+    '--- locate sheets -----------------------------------------
+    mStep = "locating sheets"
+    Set wsT = MMSheet(MM_TGT_SHEET)
+    Set wsS = MMSheet(MM_SRC_SHEET)
+    If wsT Is Nothing Then MMBail "Cannot find a sheet named " & MM_TGT_SHEET & "."
+    If wsS Is Nothing Then MMBail "Cannot find a sheet named " & MM_SRC_SHEET & "."
+    If wsT.Name = wsS.Name Then MMBail "Target and source sheets are the same sheet."
+
+    '--- read ---------------------------------------------------
+    mStep = "reading " & wsT.Name
+    aT = MMRead(wsT)
+    mStep = "reading " & wsS.Name
+    aS = MMRead(wsS)
+
+    mStep = "reading header row " & MM_HEADER_ROW
+    Set hT = MMHeaders(aT, wsT.Name)
+    Set hS = MMHeaders(aS, wsS.Name)
+
+    '--- resolve columns ---------------------------------------
+    mStep = "resolving columns on " & wsT.Name
+    cTid = MMFindCol(hT, "taskid|id", "Task ID", wsT.Name)
+
+    mStep = "resolving columns on " & wsS.Name
+    cSid = MMFindCol(hS, "taskid|id", "Task ID", wsS.Name)
+    cSs = MMFindCol(hS, "currentstartdate|currentstart", "Current Start Date", wsS.Name)
+    cSf = MMFindCol(hS, "currentfinishdate|currentfinish", "Current Finish Date", wsS.Name)
+
+    '--- index Current Month Data ------------------------------
+    mStep = "indexing " & wsS.Name
+    Set dEx = MMNewDict(MM_CASE_SENSITIVE)
+    Set dLoose = MMNewDict(False)
+
+    For i = MM_HEADER_ROW + 1 To UBound(aS, 1)
+        sID = MMCleanID(aS(i, cSid))
+        If Len(sID) > 0 Then
+            mSrcRows = mSrcRows + 1
+            If dEx.Exists(sID) Then
+                mSrcDup = mSrcDup + 1
+                srcRow = dEx(sID)
+                If MMDiffers(aS(i, cSs), aS(srcRow, cSs)) _
+                Or MMDiffers(aS(i, cSf), aS(srcRow, cSf)) Then
+                    mSrcConflict = mSrcConflict + 1
+                    MMDiagAdd mDDup, sID, "CONFLICT: kept row " & srcRow & ", ignored row " & i
+                Else
+                    MMDiagAdd mDDup, sID, "identical: kept row " & srcRow & ", ignored row " & i
+                End If
+            Else
+                dEx.Add sID, i
+            End If
+
+            If MM_LOOSE_MATCH Then
+                sNorm = MMNorm(sID)
+                If Len(sNorm) > 0 Then
+                    If dLoose.Exists(sNorm) Then
+                        dLoose(sNorm) = 0          ' 0 = ambiguous, never used
+                    Else
+                        dLoose.Add sNorm, i
+                    End If
+                End If
+            End If
+        End If
+    Next i
+
+    If dEx.Count = 0 Then
+        MMBail "No Task IDs found below row " & MM_HEADER_ROW & " on " & wsS.Name & "."
+    End If
+
+    '--- create or reuse the two output columns ----------------
+    mStep = "preparing output columns on " & wsT.Name
+    lcT = wsT.Cells(MM_HEADER_ROW, wsT.Columns.Count).End(xlToLeft).Column
+    If lcT < cTid Then lcT = cTid
+    cNewS = MMEnsureCol(wsT, hT, MM_START_HDR, lcT)
+    cNewF = MMEnsureCol(wsT, hT, MM_FINISH_HDR, lcT)
+
+    '--- match --------------------------------------------------
+    mStep = "matching tasks"
+    nRows = UBound(aT, 1) - MM_HEADER_ROW
+    If nRows < 1 Then MMBail wsT.Name & " has no data rows below row " & MM_HEADER_ROW & "."
+    ReDim outS(1 To nRows, 1 To 1)
+    ReDim outF(1 To nRows, 1 To 1)
+
+    For i = MM_HEADER_ROW + 1 To UBound(aT, 1)
+        k = i - MM_HEADER_ROW
+        sID = MMCleanID(aT(i, cTid))
+
+        If Len(sID) = 0 Then
+            mBlankID = mBlankID + 1
+        Else
+            mScanned = mScanned + 1
+            hit = False
+            srcRow = 0
+
+            If dEx.Exists(sID) Then
+                srcRow = dEx(sID)
+                mExact = mExact + 1
+                hit = True
+            ElseIf MM_LOOSE_MATCH Then
+                sNorm = MMNorm(sID)
+                If dLoose.Exists(sNorm) Then
+                    If dLoose(sNorm) > 0 Then
+                        srcRow = dLoose(sNorm)
+                        mLoose = mLoose + 1
+                        hit = True
+                        MMDiagAdd mDLoose, sID, "matched " & MMCleanID(aS(srcRow, cSid)) & " (row " & srcRow & ")"
+                    Else
+                        mAmbiguous = mAmbiguous + 1
+                        MMDiagAdd mDUnmatched, sID, "ambiguous loose match - left blank"
+                    End If
+                End If
+            End If
+
+            If hit Then
+                outS(k, 1) = MMSafeDate(aS(srcRow, cSs))
+                outF(k, 1) = MMSafeDate(aS(srcRow, cSf))
+                If IsEmpty(outS(k, 1)) And IsEmpty(outF(k, 1)) Then mNoDates = mNoDates + 1
+            Else
+                If Not dEx.Exists(sID) Then
+                    mUnmatched = mUnmatched + 1
+                    MMDiagAdd mDUnmatched, sID, "no match in " & wsS.Name
+                End If
+            End If
+        End If
+    Next i
+
+    '--- write --------------------------------------------------
+    mStep = "writing results to " & wsT.Name
+    With wsT.Cells(MM_HEADER_ROW + 1, cNewS).Resize(nRows, 1)
+        .ClearContents
+        .Interior.Pattern = xlNone
+        .NumberFormat = MM_DATE_FMT
+        .Value = outS
+    End With
+    With wsT.Cells(MM_HEADER_ROW + 1, cNewF).Resize(nRows, 1)
+        .ClearContents
+        .Interior.Pattern = xlNone
+        .NumberFormat = MM_DATE_FMT
+        .Value = outF
+    End With
+
+    mStep = "formatting"
+    MMStyleHeader wsT.Cells(MM_HEADER_ROW, cNewS)
+    MMStyleHeader wsT.Cells(MM_HEADER_ROW, cNewF)
+
+    If MM_FLAG_UNMATCHED Then
+        mStep = "flagging unmatched rows"
+        For i = MM_HEADER_ROW + 1 To UBound(aT, 1)
+            k = i - MM_HEADER_ROW
+            sID = MMCleanID(aT(i, cTid))
+            If Len(sID) > 0 Then
+                If IsEmpty(outS(k, 1)) And IsEmpty(outF(k, 1)) Then
+                    wsT.Cells(i, cNewS).Interior.Color = RGB(255, 242, 204)
+                    wsT.Cells(i, cNewF).Interior.Color = RGB(255, 242, 204)
+                End If
+            End If
+        Next i
+    End If
+
+    On Error Resume Next
+    wsT.Columns(cNewS).AutoFit
+    wsT.Columns(cNewF).AutoFit
+    On Error GoTo Fail
+
+    If MM_WRITE_DIAG Then
+        mStep = "writing diagnostics"
+        MMWriteDiag wsT.Name, wsS.Name, cNewS, cNewF
+    End If
+
+    mStep = "done"
+    Application.EnableEvents = True
+    Application.Calculation = oldCalc
+    Application.ScreenUpdating = True
+
+    msg = "Current month dates written to " & MM_TGT_SHEET & "." & vbCrLf & vbCrLf
+    msg = msg & "Columns written: " & MMColL(cNewS) & " and " & MMColL(cNewF) & vbCrLf
+    msg = msg & "Tasks scanned: " & mScanned & vbCrLf
+    msg = msg & "Matched exactly: " & mExact & vbCrLf
+    msg = msg & "Matched loosely: " & mLoose & vbCrLf
+    msg = msg & "Not found: " & mUnmatched & vbCrLf
+    msg = msg & "Ambiguous, left blank: " & mAmbiguous & vbCrLf
+    msg = msg & "Matched but both dates blank: " & mNoDates & vbCrLf
+    msg = msg & "Blank Task IDs skipped: " & mBlankID & vbCrLf & vbCrLf
+    msg = msg & MM_SRC_SHEET & " rows indexed: " & mSrcRows & vbCrLf
+    msg = msg & "Duplicate IDs in source: " & mSrcDup & vbCrLf
+    msg = msg & "  of which conflicting: " & mSrcConflict & vbCrLf
+    msg = msg & "Non-date values copied: " & mNonDate
+    MsgBox msg, vbInformation, "CEI ASOT / Current Month Match"
+    Exit Sub
+
+Fail:
+    errNum = Err.Number
+    errDesc = Err.Description
+    On Error Resume Next
+    Application.EnableEvents = True
+    Application.Calculation = xlCalculationAutomatic
+    Application.ScreenUpdating = True
+    Application.DisplayAlerts = True
+    On Error GoTo 0
+    msg = "Failed while: " & mStep & vbCrLf & vbCrLf
+    msg = msg & "Error " & errNum & ": " & errDesc
+    MsgBox msg, vbExclamation, "CEI ASOT / Current Month Match"
+End Sub
+
+'================================================
+' HELPERS
+'================================================
+Private Sub MMReset()
+    mStep = "initialising"
+    mScanned = 0
+    mExact = 0
+    mLoose = 0
+    mUnmatched = 0
+    mBlankID = 0
+    mSrcRows = 0
+    mSrcDup = 0
+    mSrcConflict = 0
+    mAmbiguous = 0
+    mNoDates = 0
+    mNonDate = 0
+    Set mDUnmatched = MMNewDict(False)
+    Set mDLoose = MMNewDict(False)
+    Set mDDup = MMNewDict(False)
+End Sub
+
+Private Sub MMBail(ByVal s As String)
+    Err.Raise 5, "MMMatch", s
+End Sub
+
+Private Function MMSheet(ByVal nm As String) As Worksheet
+    Dim ws As Worksheet
+    For Each ws In ThisWorkbook.Worksheets
+        If MMNorm(ws.Name) = MMNorm(nm) Then
+            Set MMSheet = ws
+            Exit Function
+        End If
+    Next ws
+End Function
+
+Private Function MMRead(ByVal ws As Worksheet) As Variant
+    Dim lr As Long
+    Dim lc As Long
+    Dim a As Variant
+    lr = ws.UsedRange.Row + ws.UsedRange.Rows.Count - 1
+    lc = ws.UsedRange.Column + ws.UsedRange.Columns.Count - 1
+    If lr <= MM_HEADER_ROW Then
+        MMBail "Sheet " & ws.Name & " has no data rows below row " & MM_HEADER_ROW & "."
+    End If
+    a = ws.Range(ws.Cells(1, 1), ws.Cells(lr, lc)).Value
+    If Not IsArray(a) Then MMBail "Sheet " & ws.Name & " returned a single cell, not a table."
+    MMRead = a
+End Function
+
+Private Function MMHeaders(ByRef a As Variant, ByVal shName As String) As Object
+    Dim d As Object
+    Dim c As Long
+    Dim k As String
+    Set d = CreateObject("Scripting.Dictionary")
+    d.CompareMode = 1
+    If UBound(a, 1) < MM_HEADER_ROW Then
+        MMBail "Sheet " & shName & " has fewer than " & MM_HEADER_ROW & " rows."
+    End If
+    For c = LBound(a, 2) To UBound(a, 2)
+        k = MMNorm(MMNzS(a(MM_HEADER_ROW, c)))
+        If Len(k) > 0 Then
+            If Not d.Exists(k) Then d.Add k, c
+        End If
+    Next c
+    If d.Count = 0 Then
+        MMBail "No header names in row " & MM_HEADER_ROW & " of " & shName & _
+               ". These tabs should have headers in row 1."
+    End If
+    Set MMHeaders = d
+End Function
+
+Private Function MMFindCol(ByVal d As Object, ByVal cands As String, _
+                           ByVal colLabel As String, ByVal shName As String) As Long
+    Dim a() As String
+    Dim i As Long
+    a = Split(cands, "|")
+    For i = LBound(a) To UBound(a)
+        If d.Exists(a(i)) Then
+            MMFindCol = d(a(i))
+            Exit Function
+        End If
+    Next i
+    MMBail "No " & colLabel & " column on sheet " & shName & _
+           ". Header row is " & MM_HEADER_ROW & "."
+End Function
+
+Private Function MMEnsureCol(ByVal ws As Worksheet, ByVal d As Object, _
+                             ByVal hdr As String, ByRef lc As Long) As Long
+    Dim k As String
+    k = MMNorm(hdr)
+    If d.Exists(k) Then
+        MMEnsureCol = d(k)
+    Else
+        lc = lc + 1
+        MMEnsureCol = lc
+        d.Add k, lc
+    End If
+    ws.Cells(MM_HEADER_ROW, MMEnsureCol).NumberFormat = "General"
+    ws.Cells(MM_HEADER_ROW, MMEnsureCol).Value = hdr
+End Function
+
+Private Sub MMStyleHeader(ByVal c As Range)
+    c.Font.Bold = True
+    c.Interior.Color = RGB(221, 235, 247)
+End Sub
+
+Private Function MMSafeDate(ByVal v As Variant) As Variant
+    If IsError(v) Then
+        MMSafeDate = CVErr(xlErrNA)
+    ElseIf IsNull(v) Then
+        MMSafeDate = Empty
+    ElseIf IsEmpty(v) Then
+        MMSafeDate = Empty
+    ElseIf IsDate(v) Then
+        MMSafeDate = v
+    ElseIf IsNumeric(v) Then
+        If CDbl(v) = 0 Then
+            MMSafeDate = Empty
+        Else
+            MMSafeDate = v
+        End If
+    ElseIf Len(Trim(CStr(v))) = 0 Then
+        MMSafeDate = Empty
+    Else
+        mNonDate = mNonDate + 1
+        MMSafeDate = v
+    End If
+End Function
+
+Private Function MMDiffers(ByVal a As Variant, ByVal b As Variant) As Boolean
+    If IsError(a) Or IsError(b) Then
+        MMDiffers = (IsError(a) <> IsError(b))
+    Else
+        MMDiffers = (MMNzS(a) <> MMNzS(b))
+    End If
+End Function
+
+Private Function MMCleanID(ByVal v As Variant) As String
+    If IsError(v) Then Exit Function
+    If IsNull(v) Then Exit Function
+    If IsEmpty(v) Then Exit Function
+    MMCleanID = Trim(CStr(v))
+End Function
+
+Private Function MMNzS(ByVal v As Variant) As String
+    If IsError(v) Then Exit Function
+    If IsNull(v) Then Exit Function
+    If IsEmpty(v) Then Exit Function
+    MMNzS = CStr(v)
+End Function
+
+Private Function MMNorm(ByVal s As String) As String
+    Dim i As Long
+    Dim ch As String
+    Dim code As Long
+    Dim o As String
+    Dim junk As String
+
+    junk = "_-.()/\'" & Chr(34) & "[]{}:;,"
+
+    s = LCase(s)
+    For i = 1 To Len(s)
+        ch = Mid(s, i, 1)
+        code = AscW(ch)
+        If code < 0 Then code = code + 65536
+
+        Select Case code
+            Case 0 To 32
+            Case 160
+            Case 8203, 8204, 8205, 65279
+            Case 8208 To 8213
+            Case 8216 To 8223
+            Case Else
+                If InStr(junk, ch) = 0 Then o = o & ch
+        End Select
+    Next i
+
+    MMNorm = o
+End Function
+
+Private Function MMColL(ByVal c As Long) As String
+    Dim s As String
+    Do While c > 0
+        s = Chr(65 + ((c - 1) Mod 26)) & s
+        c = (c - 1) \ 26
+    Loop
+    MMColL = s
+End Function
+
+Private Function MMNewDict(ByVal caseSens As Boolean) As Object
+    Dim d As Object
+    Set d = CreateObject("Scripting.Dictionary")
+    If caseSens Then
+        d.CompareMode = 0
+    Else
+        d.CompareMode = 1
+    End If
+    Set MMNewDict = d
+End Function
+
+Private Function MMYesNo(ByVal b As Boolean) As String
+    If b Then MMYesNo = "yes" Else MMYesNo = "no"
+End Function
+
+Private Sub MMDiagAdd(ByVal d As Object, ByVal k As String, ByVal v As String)
+    If d.Count >= MM_DIAG_CAP Then Exit Sub
+    If Not d.Exists(k) Then d.Add k, v
+End Sub
+
+Private Sub MMWriteDiag(ByVal tgtName As String, ByVal srcName As String, _
+                        ByVal cS As Long, ByVal cF As Long)
+    Dim ws As Worksheet
+    Dim r As Long
+    Dim k As Variant
+
+    Application.DisplayAlerts = False
+    On Error Resume Next
+    ThisWorkbook.Worksheets(MM_DIAG_SHEET).Delete
+    On Error GoTo 0
+    Application.DisplayAlerts = True
+
+    Set ws = ThisWorkbook.Worksheets.Add(, ThisWorkbook.Worksheets(ThisWorkbook.Worksheets.Count))
+    ws.Name = MM_DIAG_SHEET
+    ws.Range("A1").Value = "Check"
+    ws.Range("B1").Value = "Value"
+    ws.Range("A1:B1").Font.Bold = True
+
+    r = 2
+    r = MMDiagRow(ws, r, "Run timestamp", CStr(Now))
+    r = MMDiagRow(ws, r, "Target sheet", tgtName)
+    r = MMDiagRow(ws, r, "Source sheet", srcName)
+    r = MMDiagRow(ws, r, "Header row used", CStr(MM_HEADER_ROW))
+    r = MMDiagRow(ws, r, "Start column written", MMColL(cS))
+    r = MMDiagRow(ws, r, "Finish column written", MMColL(cF))
+    r = MMDiagRow(ws, r, "Case-sensitive IDs", MMYesNo(MM_CASE_SENSITIVE))
+    r = MMDiagRow(ws, r, "Loose match enabled", MMYesNo(MM_LOOSE_MATCH))
+    r = MMDiagRow(ws, r, "Tasks scanned", CStr(mScanned))
+    r = MMDiagRow(ws, r, "Matched exactly", CStr(mExact))
+    r = MMDiagRow(ws, r, "Matched loosely", CStr(mLoose))
+    r = MMDiagRow(ws, r, "Not found", CStr(mUnmatched))
+    r = MMDiagRow(ws, r, "Ambiguous, left blank", CStr(mAmbiguous))
+    r = MMDiagRow(ws, r, "Matched but both dates blank", CStr(mNoDates))
+    r = MMDiagRow(ws, r, "Blank Task IDs skipped", CStr(mBlankID))
+    r = MMDiagRow(ws, r, "Source rows indexed", CStr(mSrcRows))
+    r = MMDiagRow(ws, r, "Duplicate IDs in source", CStr(mSrcDup))
+    r = MMDiagRow(ws, r, "Conflicting duplicates", CStr(mSrcConflict))
+    r = MMDiagRow(ws, r, "Non-date values copied", CStr(mNonDate))
+    r = r + 1
+
+    r = MMDiagBlock(ws, r, "Task IDs with no usable match", mDUnmatched)
+    r = MMDiagBlock(ws, r, "Loose matches (audit these)", mDLoose)
+    r = MMDiagBlock(ws, r, "Duplicate IDs in " & srcName, mDDup)
+
+    ws.Columns("A:B").AutoFit
+End Sub
+
+Private Function MMDiagBlock(ByVal ws As Worksheet, ByVal r As Long, _
+                             ByVal title As String, ByVal d As Object) As Long
+    Dim k As Variant
+    ws.Cells(r, 1).Value = title & " (" & d.Count & ")"
+    ws.Cells(r, 1).Font.Bold = True
+    r = r + 1
+    For Each k In d.Keys
+        ws.Cells(r, 1).NumberFormat = "@"
+        ws.Cells(r, 1).Value = k
+        ws.Cells(r, 2).Value = d(k)
+        r = r + 1
+    Next k
+    MMDiagBlock = r + 1
+End Function
+
+Private Function MMDiagRow(ByVal ws As Worksheet, ByVal r As Long, _
+                           ByVal a As String, ByVal b As String) As Long
+    ws.Cells(r, 1).Value = a
+    ws.Cells(r, 2).Value = b
+    MMDiagRow = r + 1
+End Function
