@@ -1,0 +1,190 @@
+Option Explicit
+
+Sub CreateCEIWindowChart()
+
+    ' ==== CONFIGURATION - Adjust these to match your sheet's headers ====
+    Const ORIG_FINISH_HEADER As String = "Original Finish"
+    Const CURR_FINISH_HEADER As String = "Current Month Finish"
+    ' =====================================================================
+
+    Dim wsData As Worksheet
+    Dim wsChart As Worksheet
+    Dim startDate As Date, finishDate As Date
+    Dim strInput As String
+    Dim headerRow As Range
+    Dim origCol As Long, currCol As Long
+    Dim lastRow As Long, r As Long
+    Dim origDate As Variant, currDate As Variant
+    Dim monthDiff As Long
+    Dim dictMonths As Object
+    Dim monthKey As String
+    Dim i As Long, j As Long
+
+    Set wsData = ActiveSheet
+
+    ' --- Prompt user for CEI Window Start ---
+    strInput = InputBox("Enter the CEI Window START date (e.g., 1/1/2026):", "CEI Window Start")
+    If strInput = "" Then Exit Sub
+    If Not IsDate(strInput) Then
+        MsgBox "Invalid start date entered. Macro cancelled.", vbExclamation
+        Exit Sub
+    End If
+    startDate = CDate(strInput)
+
+    ' --- Prompt user for CEI Window Finish ---
+    strInput = InputBox("Enter the CEI Window FINISH date (e.g., 6/30/2026):", "CEI Window Finish")
+    If strInput = "" Then Exit Sub
+    If Not IsDate(strInput) Then
+        MsgBox "Invalid finish date entered. Macro cancelled.", vbExclamation
+        Exit Sub
+    End If
+    finishDate = CDate(strInput)
+
+    If finishDate < startDate Then
+        MsgBox "The Window Finish date must be on or after the Window Start date.", vbExclamation
+        Exit Sub
+    End If
+
+    ' --- Locate the required columns by header name (assumes headers in row 1) ---
+    Set headerRow = wsData.Rows(1)
+    origCol = 0: currCol = 0
+    For i = 1 To wsData.Cells(1, wsData.Columns.Count).End(xlToLeft).Column
+        If Trim(UCase(wsData.Cells(1, i).Value)) = UCase(ORIG_FINISH_HEADER) Then origCol = i
+        If Trim(UCase(wsData.Cells(1, i).Value)) = UCase(CURR_FINISH_HEADER) Then currCol = i
+    Next i
+
+    If origCol = 0 Or currCol = 0 Then
+        MsgBox "Could not find the '" & ORIG_FINISH_HEADER & "' and/or '" & _
+               CURR_FINISH_HEADER & "' columns in row 1.", vbExclamation
+        Exit Sub
+    End If
+
+    lastRow = wsData.Cells(wsData.Rows.Count, origCol).End(xlUp).Row
+
+    ' --- Tally tasks by Original Finish month, bucketed by slip category ---
+    ' Dictionary key = "yyyymm", item = Array(Hits, Miss1, Miss2, Miss3Plus)
+    Set dictMonths = CreateObject("Scripting.Dictionary")
+
+    Dim arrCounts(0 To 3) As Long
+    Dim tmp As Variant
+
+    For r = 2 To lastRow
+        origDate = wsData.Cells(r, origCol).Value
+        currDate = wsData.Cells(r, currCol).Value
+
+        If IsDate(origDate) Then
+            If CDate(origDate) >= startDate And CDate(origDate) <= finishDate Then
+
+                monthKey = Format(CDate(origDate), "yyyymm")
+                If Not dictMonths.Exists(monthKey) Then
+                    dictMonths.Add monthKey, Array(0&, 0&, 0&, 0&)
+                End If
+
+                ' Determine slip in whole months
+                If IsDate(currDate) Then
+                    monthDiff = DateDiff("m", CDate(origDate), CDate(currDate))
+                Else
+                    monthDiff = 0 ' No current finish date; treat as a Hit (adjust if desired)
+                End If
+
+                tmp = dictMonths(monthKey)
+                Select Case monthDiff
+                    Case Is <= 0: tmp(0) = tmp(0) + 1   ' Hit (same month or earlier)
+                    Case 1:       tmp(1) = tmp(1) + 1   ' Miss - 1 Month
+                    Case 2:       tmp(2) = tmp(2) + 1   ' Miss - 2 Months
+                    Case Else:    tmp(3) = tmp(3) + 1   ' Miss - 3+ Months
+                End Select
+                dictMonths(monthKey) = tmp
+
+            End If
+        End If
+    Next r
+
+    If dictMonths.Count = 0 Then
+        MsgBox "No tasks found with an Original Finish date in the specified window.", vbInformation
+        Exit Sub
+    End If
+
+    ' --- Sort the month keys chronologically ---
+    Dim keys() As Variant
+    keys = dictMonths.keys
+    Dim swapTmp As Variant
+    For i = LBound(keys) To UBound(keys) - 1
+        For j = i + 1 To UBound(keys)
+            If keys(j) < keys(i) Then
+                swapTmp = keys(i): keys(i) = keys(j): keys(j) = swapTmp
+            End If
+        Next j
+    Next i
+
+    ' --- Create the new sheet ---
+    Dim sheetName As String
+    sheetName = "CEI Chart"
+    Application.DisplayAlerts = False
+    On Error Resume Next
+    ThisWorkbook.Worksheets(sheetName).Delete
+    On Error GoTo 0
+    Application.DisplayAlerts = True
+
+    Set wsChart = ThisWorkbook.Worksheets.Add(After:=ThisWorkbook.Worksheets(ThisWorkbook.Worksheets.Count))
+    wsChart.Name = sheetName
+
+    ' --- Write the summary table ---
+    With wsChart
+        .Range("A1").Value = "Month"
+        .Range("B1").Value = "Hits"
+        .Range("C1").Value = "Miss - 1 Month"
+        .Range("D1").Value = "Miss - 2 Months"
+        .Range("E1").Value = "Miss - 3+ Months"
+        .Range("A1:E1").Font.Bold = True
+
+        For i = LBound(keys) To UBound(keys)
+            monthKey = keys(i)
+            tmp = dictMonths(monthKey)
+            ' Convert "yyyymm" back to a display label "mm-yyyy"
+            .Cells(i + 2, 1).Value = Right(monthKey, 2) & "-" & Left(monthKey, 4)
+            .Cells(i + 2, 2).Value = tmp(0)
+            .Cells(i + 2, 3).Value = tmp(1)
+            .Cells(i + 2, 4).Value = tmp(2)
+            .Cells(i + 2, 5).Value = tmp(3)
+        Next i
+
+        .Columns("A:E").AutoFit
+    End With
+
+    ' --- Build the stacked bar (column) chart ---
+    Dim chtObj As ChartObject
+    Dim numRows As Long
+    numRows = dictMonths.Count
+
+    Set chtObj = wsChart.ChartObjects.Add(Left:=350, Top:=10, Width:=700, Height:=400)
+
+    With chtObj.Chart
+        .ChartType = xlColumnStacked
+        .SetSourceData Source:=wsChart.Range(wsChart.Cells(1, 1), wsChart.Cells(numRows + 1, 5))
+
+        .HasTitle = True
+        .ChartTitle.Text = "CEI Window: " & Format(startDate, "mm/dd/yyyy") & _
+                           " - " & Format(finishDate, "mm/dd/yyyy")
+
+        ' Axis titles
+        .Axes(xlCategory, xlPrimary).HasTitle = True
+        .Axes(xlCategory, xlPrimary).AxisTitle.Text = "Original Finish Month (mm-yyyy)"
+        .Axes(xlValue, xlPrimary).HasTitle = True
+        .Axes(xlValue, xlPrimary).AxisTitle.Text = "Task Count"
+
+        ' Series colors
+        .SeriesCollection(1).Format.Fill.ForeColor.RGB = RGB(0, 112, 192)    ' Hits - Blue
+        .SeriesCollection(2).Format.Fill.ForeColor.RGB = RGB(255, 255, 0)    ' Miss - 1 Month - Yellow
+        .SeriesCollection(3).Format.Fill.ForeColor.RGB = RGB(255, 165, 0)    ' Miss - 2 Months - Orange
+        .SeriesCollection(4).Format.Fill.ForeColor.RGB = RGB(255, 0, 0)      ' Miss - 3+ Months - Red
+
+        .HasLegend = True
+        .Legend.Position = xlLegendPositionBottom
+    End With
+
+    MsgBox "CEI chart created successfully on the '" & sheetName & "' tab." & vbCrLf & _
+           "Tasks in window: " & Application.Sum(wsChart.Range(wsChart.Cells(2, 2), wsChart.Cells(numRows + 1, 5))), _
+           vbInformation
+
+End Sub
