@@ -3,7 +3,7 @@ Option Explicit
 Sub ConsolidateSPDData()
 
     Const OUTPUT_SHEET As String = "Consolidated SPD Data"
-    Const CUSTOM_SHEET As String = "Task Custom Values"
+    Const CUSTOM_FIELD_SHEET As String = "Task Custom Field Values"
     
     ' --- Header names to look for in each monthly tab (edit these to match your export) ---
     Const HDR_TASK_ID As String = "Task ID"
@@ -11,13 +11,13 @@ Sub ConsolidateSPDData()
     Const HDR_START As String = "Current Start Date"
     Const HDR_FINISH As String = "Current Finish Date"
     
-    ' --- Header names on the Task Custom Values tab (edit these to match your export) ---
-    Const HDR_CUSTOM_FIELD_ID As String = "Custom Field ID"
-    Const HDR_CUSTOM_VALUE As String = "Value"
+    ' --- Header names for the Task Custom Field Values tab ---
+    Const HDR_CF_ID As String = "Custom Field ID"
+    Const HDR_CF_VALUE As String = "Value"
     
-    ' --- Custom Field IDs to map ---
-    Const FIELD_CAM As String = "Field_02"
-    Const FIELD_IPT As String = "Field_03"
+    ' --- Custom Field IDs to capture ---
+    Const CF_CAM As String = "Field_02"
+    Const CF_IPT As String = "Field_03"
 
     Dim ws As Worksheet, outWs As Worksheet
     Dim i As Long, j As Long
@@ -60,7 +60,62 @@ Sub ConsolidateSPDData()
     Set earliestWs = sheetArr(1)
     
     ' =====================================================
-    ' 3. Create (or recreate) the output sheet
+    ' 3. Build CAM / IPT lookups from Task Custom Field Values
+    ' =====================================================
+    Dim camDict As Object, iptDict As Object
+    Set camDict = CreateObject("Scripting.Dictionary")
+    Set iptDict = CreateObject("Scripting.Dictionary")
+    camDict.CompareMode = vbTextCompare
+    iptDict.CompareMode = vbTextCompare
+    
+    Dim cfWs As Worksheet
+    Dim cfExists As Boolean
+    cfExists = False
+    
+    On Error Resume Next
+    Set cfWs = ThisWorkbook.Worksheets(CUSTOM_FIELD_SHEET)
+    On Error GoTo 0
+    
+    Dim lastRow As Long, r As Long
+    Dim taskID As String, cfID As String
+    
+    If Not cfWs Is Nothing Then
+        Dim cfTaskIdCol As Long, cfIdCol As Long, cfValueCol As Long
+        cfTaskIdCol = FindHeader(cfWs, HDR_TASK_ID)
+        cfIdCol = FindHeader(cfWs, HDR_CF_ID)
+        cfValueCol = FindHeader(cfWs, HDR_CF_VALUE)
+        
+        If cfTaskIdCol > 0 And cfIdCol > 0 And cfValueCol > 0 Then
+            cfExists = True
+            lastRow = cfWs.Cells(cfWs.Rows.Count, cfTaskIdCol).End(xlUp).Row
+            
+            For r = 2 To lastRow
+                taskID = Trim(CStr(cfWs.Cells(r, cfTaskIdCol).Value))
+                cfID = Trim(CStr(cfWs.Cells(r, cfIdCol).Value))
+                
+                If Len(taskID) > 0 Then
+                    If StrComp(cfID, CF_CAM, vbTextCompare) = 0 Then
+                        If Not camDict.Exists(taskID) Then
+                            camDict.Add taskID, cfWs.Cells(r, cfValueCol).Value
+                        End If
+                    ElseIf StrComp(cfID, CF_IPT, vbTextCompare) = 0 Then
+                        If Not iptDict.Exists(taskID) Then
+                            iptDict.Add taskID, cfWs.Cells(r, cfValueCol).Value
+                        End If
+                    End If
+                End If
+            Next r
+        Else
+            MsgBox "Tab '" & CUSTOM_FIELD_SHEET & "' was found, but one or more expected headers " & _
+                   "('" & HDR_TASK_ID & "', '" & HDR_CF_ID & "', '" & HDR_CF_VALUE & "') were not. " & _
+                   "CAM/IPT columns will be left blank.", vbExclamation
+        End If
+    Else
+        MsgBox "Tab '" & CUSTOM_FIELD_SHEET & "' was not found. CAM/IPT columns will be left blank.", vbExclamation
+    End If
+    
+    ' =====================================================
+    ' 4. Create (or recreate) the output sheet
     ' =====================================================
     Application.DisplayAlerts = False
     On Error Resume Next
@@ -72,7 +127,8 @@ Sub ConsolidateSPDData()
     outWs.Name = OUTPUT_SHEET
     
     ' =====================================================
-    ' 4. Build the unique Task ID list from the earliest tab
+    ' 5. Build unique Task ID list from earliest tab,
+    '    populating CAM and IPT as we go
     ' =====================================================
     Dim idCol As Long, nameCol As Long
     idCol = FindHeader(earliestWs, HDR_TASK_ID)
@@ -93,9 +149,7 @@ Sub ConsolidateSPDData()
     outWs.Cells(1, 3).Value = "CAM"
     outWs.Cells(1, 4).Value = "IPT"
     
-    Dim lastRow As Long, r As Long, outRow As Long
-    Dim taskID As String
-    
+    Dim outRow As Long
     lastRow = earliestWs.Cells(earliestWs.Rows.Count, idCol).End(xlUp).Row
     outRow = 2
     
@@ -106,56 +160,18 @@ Sub ConsolidateSPDData()
                 taskDict.Add taskID, outRow                  ' store the output row for this ID
                 outWs.Cells(outRow, 1).Value = taskID
                 outWs.Cells(outRow, 2).Value = earliestWs.Cells(r, nameCol).Value
+                
+                If camDict.Exists(taskID) Then
+                    outWs.Cells(outRow, 3).Value = camDict(taskID)
+                End If
+                If iptDict.Exists(taskID) Then
+                    outWs.Cells(outRow, 4).Value = iptDict(taskID)
+                End If
+                
                 outRow = outRow + 1
             End If
         End If
     Next r
-    
-    ' =====================================================
-    ' 5. Pull CAM / IPT values from "Task Custom Values" tab
-    ' =====================================================
-    Dim customWs As Worksheet
-    Dim customFound As Boolean
-    customFound = False
-    
-    On Error Resume Next
-    Set customWs = ThisWorkbook.Worksheets(CUSTOM_SHEET)
-    On Error GoTo 0
-    
-    If Not customWs Is Nothing Then
-        Dim cIdCol As Long, cFieldCol As Long, cValCol As Long
-        cIdCol = FindHeader(customWs, HDR_TASK_ID)
-        cFieldCol = FindHeader(customWs, HDR_CUSTOM_FIELD_ID)
-        cValCol = FindHeader(customWs, HDR_CUSTOM_VALUE)
-        
-        If cIdCol > 0 And cFieldCol > 0 And cValCol > 0 Then
-            customFound = True
-            Dim fieldID As String
-            
-            lastRow = customWs.Cells(customWs.Rows.Count, cIdCol).End(xlUp).Row
-            
-            For r = 2 To lastRow
-                taskID = Trim(CStr(customWs.Cells(r, cIdCol).Value))
-                If Len(taskID) > 0 Then
-                    If taskDict.Exists(taskID) Then
-                        fieldID = Trim(CStr(customWs.Cells(r, cFieldCol).Value))
-                        
-                        If StrComp(fieldID, FIELD_CAM, vbTextCompare) = 0 Then
-                            outWs.Cells(taskDict(taskID), 3).Value = customWs.Cells(r, cValCol).Value   ' CAM
-                        ElseIf StrComp(fieldID, FIELD_IPT, vbTextCompare) = 0 Then
-                            outWs.Cells(taskDict(taskID), 4).Value = customWs.Cells(r, cValCol).Value   ' IPT
-                        End If
-                    End If
-                End If
-            Next r
-        Else
-            MsgBox "Tab '" & CUSTOM_SHEET & "' was found but one or more of these headers is missing:" & vbNewLine & _
-                   "'" & HDR_TASK_ID & "', '" & HDR_CUSTOM_FIELD_ID & "', '" & HDR_CUSTOM_VALUE & "'" & vbNewLine & vbNewLine & _
-                   "CAM and IPT columns will be left blank.", vbExclamation
-        End If
-    Else
-        MsgBox "Tab '" & CUSTOM_SHEET & "' was not found. CAM and IPT columns will be left blank.", vbExclamation
-    End If
     
     ' =====================================================
     ' 6. For each monthly tab, add Start/Finish columns
@@ -164,7 +180,7 @@ Sub ConsolidateSPDData()
     Dim outStartCol As Long, outFinishCol As Long
     Dim s As Long
     
-    outStartCol = 5   ' first pair of columns goes in E and F (after CAM and IPT)
+    outStartCol = 5   ' first pair of date columns now goes in E and F (after CAM/IPT)
     
     For s = 1 To sheetCount
         Set ws = sheetArr(s)
@@ -214,8 +230,8 @@ Sub ConsolidateSPDData()
     MsgBox "Consolidation complete!" & vbNewLine & _
            taskDict.Count & " unique tasks pulled from earliest tab (" & earliestWs.Name & ")" & vbNewLine & _
            sheetCount & " monthly tabs processed." & vbNewLine & _
-           IIf(customFound, "CAM/IPT values applied from '" & CUSTOM_SHEET & "'.", _
-               "CAM/IPT values NOT applied (see earlier warning)."), vbInformation
+           IIf(cfExists, camDict.Count & " CAM values and " & iptDict.Count & " IPT values found.", _
+           "Custom field data was not loaded."), vbInformation
 
 End Sub
 
