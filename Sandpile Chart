@@ -1,0 +1,212 @@
+Option Explicit
+
+Sub CreateSandpileChart()
+
+    ' ==== CONFIGURATION - Adjust these to match your workbook ====
+    Const ASOT_SHEET As String = "CEI ASOT"
+    Const ASOT_HEADER As String = "Original Finish"
+    Const CURR_SHEET As String = "Current Month Data"
+    Const CURR_HEADER As String = "Current Finish Date"
+    Const CHART_SHEET As String = "Sandpile Chart"
+    ' =============================================================
+
+    Dim wsASOT As Worksheet, wsCurr As Worksheet, wsChart As Worksheet
+    Dim startDate As Date, finishDate As Date
+    Dim strInput As String
+    Dim dictASOT As Object, dictCurr As Object
+    Dim i As Long, j As Long
+
+    ' --- Verify source sheets exist ---
+    On Error Resume Next
+    Set wsASOT = ThisWorkbook.Worksheets(ASOT_SHEET)
+    Set wsCurr = ThisWorkbook.Worksheets(CURR_SHEET)
+    On Error GoTo 0
+
+    If wsASOT Is Nothing Then
+        MsgBox "Could not find a tab named '" & ASOT_SHEET & "'.", vbExclamation
+        Exit Sub
+    End If
+    If wsCurr Is Nothing Then
+        MsgBox "Could not find a tab named '" & CURR_SHEET & "'.", vbExclamation
+        Exit Sub
+    End If
+
+    ' --- Prompt user for Sandpile Window Start ---
+    strInput = InputBox("Enter the Sandpile Window START date (e.g., 1/1/2026):", "Sandpile Window Start")
+    If strInput = "" Then Exit Sub
+    If Not IsDate(strInput) Then
+        MsgBox "Invalid start date entered. Macro cancelled.", vbExclamation
+        Exit Sub
+    End If
+    startDate = CDate(strInput)
+
+    ' --- Prompt user for Sandpile Window Finish ---
+    strInput = InputBox("Enter the Sandpile Window FINISH date (e.g., 6/30/2026):", "Sandpile Window Finish")
+    If strInput = "" Then Exit Sub
+    If Not IsDate(strInput) Then
+        MsgBox "Invalid finish date entered. Macro cancelled.", vbExclamation
+        Exit Sub
+    End If
+    finishDate = CDate(strInput)
+
+    If finishDate < startDate Then
+        MsgBox "The Window Finish date must be on or after the Window Start date.", vbExclamation
+        Exit Sub
+    End If
+
+    ' --- Tally each source into its own dictionary (key = "yyyymm", item = count) ---
+    Set dictASOT = TallyMonthCounts(wsASOT, ASOT_HEADER, startDate, finishDate)
+    Set dictCurr = TallyMonthCounts(wsCurr, CURR_HEADER, startDate, finishDate)
+
+    If dictASOT Is Nothing Or dictCurr Is Nothing Then Exit Sub ' Error already shown
+
+    If dictASOT.Count = 0 And dictCurr.Count = 0 Then
+        MsgBox "No tasks found in either tab within the specified window.", vbInformation
+        Exit Sub
+    End If
+
+    ' --- Build a combined, sorted list of all month keys from both sources ---
+    Dim dictAll As Object
+    Set dictAll = CreateObject("Scripting.Dictionary")
+
+    Dim k As Variant
+    For Each k In dictASOT.keys
+        If Not dictAll.Exists(k) Then dictAll.Add k, True
+    Next k
+    For Each k In dictCurr.keys
+        If Not dictAll.Exists(k) Then dictAll.Add k, True
+    Next k
+
+    Dim keys() As Variant
+    keys = dictAll.keys
+
+    ' Simple bubble sort for chronological order
+    Dim swapTmp As Variant
+    For i = LBound(keys) To UBound(keys) - 1
+        For j = i + 1 To UBound(keys)
+            If keys(j) < keys(i) Then
+                swapTmp = keys(i): keys(i) = keys(j): keys(j) = swapTmp
+            End If
+        Next j
+    Next i
+
+    ' --- Create (or recreate) the chart sheet ---
+    Application.DisplayAlerts = False
+    On Error Resume Next
+    ThisWorkbook.Worksheets(CHART_SHEET).Delete
+    On Error GoTo 0
+    Application.DisplayAlerts = True
+
+    Set wsChart = ThisWorkbook.Worksheets.Add(After:=ThisWorkbook.Worksheets(ThisWorkbook.Worksheets.Count))
+    wsChart.Name = CHART_SHEET
+
+    ' --- Write the summary table ---
+    With wsChart
+        .Range("A1").Value = "Month"
+        .Range("B1").Value = ASOT_SHEET
+        .Range("C1").Value = CURR_SHEET
+        .Range("A1:C1").Font.Bold = True
+
+        For i = LBound(keys) To UBound(keys)
+            ' Convert "yyyymm" key back to a display label "mm-yyyy"
+            .Cells(i + 2, 1).Value = Right(keys(i), 2) & "-" & Left(keys(i), 4)
+
+            If dictASOT.Exists(keys(i)) Then
+                .Cells(i + 2, 2).Value = dictASOT(keys(i))
+            Else
+                .Cells(i + 2, 2).Value = 0
+            End If
+
+            If dictCurr.Exists(keys(i)) Then
+                .Cells(i + 2, 3).Value = dictCurr(keys(i))
+            Else
+                .Cells(i + 2, 3).Value = 0
+            End If
+        Next i
+
+        .Columns("A:C").AutoFit
+    End With
+
+    ' --- Build the clustered (dual) bar chart ---
+    Dim chtObj As ChartObject
+    Dim numRows As Long
+    numRows = dictAll.Count
+
+    Set chtObj = wsChart.ChartObjects.Add(Left:=300, Top:=10, Width:=700, Height:=400)
+
+    With chtObj.Chart
+        .ChartType = xlColumnClustered
+        .SetSourceData Source:=wsChart.Range(wsChart.Cells(1, 1), wsChart.Cells(numRows + 1, 3))
+
+        .HasTitle = True
+        .ChartTitle.Text = "Sandpile: " & Format(startDate, "mm/dd/yyyy") & _
+                           " - " & Format(finishDate, "mm/dd/yyyy")
+
+        ' Axis titles
+        .Axes(xlCategory, xlPrimary).HasTitle = True
+        .Axes(xlCategory, xlPrimary).AxisTitle.Text = "Finish Month (mm-yyyy)"
+        .Axes(xlValue, xlPrimary).HasTitle = True
+        .Axes(xlValue, xlPrimary).AxisTitle.Text = "Task Count"
+
+        ' Series colors to differentiate the two sources
+        .SeriesCollection(1).Format.Fill.ForeColor.RGB = RGB(0, 112, 192)   ' CEI ASOT - Blue
+        .SeriesCollection(2).Format.Fill.ForeColor.RGB = RGB(112, 173, 71)  ' Current Month Data - Green
+
+        .HasLegend = True
+        .Legend.Position = xlLegendPositionBottom
+    End With
+
+    MsgBox "Sandpile chart created successfully on the '" & CHART_SHEET & "' tab." & vbCrLf & _
+           ASOT_SHEET & " tasks in window: " & Application.Sum(wsChart.Range(wsChart.Cells(2, 2), wsChart.Cells(numRows + 1, 2))) & vbCrLf & _
+           CURR_SHEET & " tasks in window: " & Application.Sum(wsChart.Range(wsChart.Cells(2, 3), wsChart.Cells(numRows + 1, 3))), _
+           vbInformation
+
+End Sub
+
+' Helper: counts rows per month ("yyyymm") for dates within [startDate, finishDate]
+' in the column whose row-1 header matches headerName on the given sheet.
+Private Function TallyMonthCounts(ws As Worksheet, headerName As String, _
+                                  startDate As Date, finishDate As Date) As Object
+
+    Dim dict As Object
+    Dim col As Long, lastCol As Long, lastRow As Long, r As Long
+    Dim dt As Variant
+    Dim monthKey As String
+
+    ' Find the column by header name in row 1
+    col = 0
+    lastCol = ws.Cells(1, ws.Columns.Count).End(xlToLeft).Column
+    For r = 1 To lastCol
+        If Trim(UCase(ws.Cells(1, r).Value)) = UCase(headerName) Then
+            col = r
+            Exit For
+        End If
+    Next r
+
+    If col = 0 Then
+        MsgBox "Could not find the '" & headerName & "' column in row 1 of the '" & _
+               ws.Name & "' tab.", vbExclamation
+        Set TallyMonthCounts = Nothing
+        Exit Function
+    End If
+
+    Set dict = CreateObject("Scripting.Dictionary")
+    lastRow = ws.Cells(ws.Rows.Count, col).End(xlUp).Row
+
+    For r = 2 To lastRow
+        dt = ws.Cells(r, col).Value
+        If IsDate(dt) Then
+            If CDate(dt) >= startDate And CDate(dt) <= finishDate Then
+                monthKey = Format(CDate(dt), "yyyymm")
+                If dict.Exists(monthKey) Then
+                    dict(monthKey) = dict(monthKey) + 1
+                Else
+                    dict.Add monthKey, 1&
+                End If
+            End If
+        End If
+    Next r
+
+    Set TallyMonthCounts = dict
+
+End Function
