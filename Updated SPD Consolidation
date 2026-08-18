@@ -1,0 +1,249 @@
+Option Explicit
+
+Sub ConsolidateSPDData()
+
+    Const OUTPUT_SHEET As String = "Consolidated SPD Data"
+    Const CUSTOM_SHEET As String = "Task Custom Values"
+    
+    ' --- Header names to look for in each monthly tab (edit these to match your export) ---
+    Const HDR_TASK_ID As String = "Task ID"
+    Const HDR_TASK_NAME As String = "Name"
+    Const HDR_START As String = "Current Start Date"
+    Const HDR_FINISH As String = "Current Finish Date"
+    
+    ' --- Header names on the Task Custom Values tab (edit these to match your export) ---
+    Const HDR_CUSTOM_FIELD_ID As String = "Custom Field ID"
+    Const HDR_CUSTOM_VALUE As String = "Value"
+    
+    ' --- Custom Field IDs to map ---
+    Const FIELD_CAM As String = "Field_02"
+    Const FIELD_IPT As String = "Field_03"
+
+    Dim ws As Worksheet, outWs As Worksheet
+    Dim i As Long, j As Long
+    
+    ' =====================================================
+    ' 1. Collect all mm-yyyy sheets
+    ' =====================================================
+    Dim sheetArr() As Worksheet
+    Dim sheetCount As Long
+    sheetCount = 0
+    
+    For Each ws In ThisWorkbook.Worksheets
+        If ws.Name Like "##-####" And IsDate("01-" & ws.Name) Then
+            sheetCount = sheetCount + 1
+            ReDim Preserve sheetArr(1 To sheetCount)
+            Set sheetArr(sheetCount) = ws
+        End If
+    Next ws
+    
+    If sheetCount = 0 Then
+        MsgBox "No tabs found with mm-yyyy naming format.", vbExclamation
+        Exit Sub
+    End If
+    
+    ' =====================================================
+    ' 2. Sort sheets chronologically (earliest first)
+    ' =====================================================
+    Dim tmp As Worksheet
+    For i = 1 To sheetCount - 1
+        For j = i + 1 To sheetCount
+            If SheetDate(sheetArr(j).Name) < SheetDate(sheetArr(i).Name) Then
+                Set tmp = sheetArr(i)
+                Set sheetArr(i) = sheetArr(j)
+                Set sheetArr(j) = tmp
+            End If
+        Next j
+    Next i
+    
+    Dim earliestWs As Worksheet
+    Set earliestWs = sheetArr(1)
+    
+    ' =====================================================
+    ' 3. Create (or recreate) the output sheet
+    ' =====================================================
+    Application.DisplayAlerts = False
+    On Error Resume Next
+    ThisWorkbook.Worksheets(OUTPUT_SHEET).Delete
+    On Error GoTo 0
+    Application.DisplayAlerts = True
+    
+    Set outWs = ThisWorkbook.Worksheets.Add(Before:=ThisWorkbook.Worksheets(1))
+    outWs.Name = OUTPUT_SHEET
+    
+    ' =====================================================
+    ' 4. Build the unique Task ID list from the earliest tab
+    ' =====================================================
+    Dim idCol As Long, nameCol As Long
+    idCol = FindHeader(earliestWs, HDR_TASK_ID)
+    nameCol = FindHeader(earliestWs, HDR_TASK_NAME)
+    
+    If idCol = 0 Or nameCol = 0 Then
+        MsgBox "Could not find '" & HDR_TASK_ID & "' and/or '" & HDR_TASK_NAME & _
+               "' headers on tab '" & earliestWs.Name & "'.", vbCritical
+        Exit Sub
+    End If
+    
+    Dim taskDict As Object
+    Set taskDict = CreateObject("Scripting.Dictionary")
+    taskDict.CompareMode = vbTextCompare
+    
+    outWs.Cells(1, 1).Value = "Task ID"
+    outWs.Cells(1, 2).Value = "Task Name"
+    outWs.Cells(1, 3).Value = "CAM"
+    outWs.Cells(1, 4).Value = "IPT"
+    
+    Dim lastRow As Long, r As Long, outRow As Long
+    Dim taskID As String
+    
+    lastRow = earliestWs.Cells(earliestWs.Rows.Count, idCol).End(xlUp).Row
+    outRow = 2
+    
+    For r = 2 To lastRow
+        taskID = Trim(CStr(earliestWs.Cells(r, idCol).Value))
+        If Len(taskID) > 0 Then
+            If Not taskDict.Exists(taskID) Then
+                taskDict.Add taskID, outRow                  ' store the output row for this ID
+                outWs.Cells(outRow, 1).Value = taskID
+                outWs.Cells(outRow, 2).Value = earliestWs.Cells(r, nameCol).Value
+                outRow = outRow + 1
+            End If
+        End If
+    Next r
+    
+    ' =====================================================
+    ' 5. Pull CAM / IPT values from "Task Custom Values" tab
+    ' =====================================================
+    Dim customWs As Worksheet
+    Dim customFound As Boolean
+    customFound = False
+    
+    On Error Resume Next
+    Set customWs = ThisWorkbook.Worksheets(CUSTOM_SHEET)
+    On Error GoTo 0
+    
+    If Not customWs Is Nothing Then
+        Dim cIdCol As Long, cFieldCol As Long, cValCol As Long
+        cIdCol = FindHeader(customWs, HDR_TASK_ID)
+        cFieldCol = FindHeader(customWs, HDR_CUSTOM_FIELD_ID)
+        cValCol = FindHeader(customWs, HDR_CUSTOM_VALUE)
+        
+        If cIdCol > 0 And cFieldCol > 0 And cValCol > 0 Then
+            customFound = True
+            Dim fieldID As String
+            
+            lastRow = customWs.Cells(customWs.Rows.Count, cIdCol).End(xlUp).Row
+            
+            For r = 2 To lastRow
+                taskID = Trim(CStr(customWs.Cells(r, cIdCol).Value))
+                If Len(taskID) > 0 Then
+                    If taskDict.Exists(taskID) Then
+                        fieldID = Trim(CStr(customWs.Cells(r, cFieldCol).Value))
+                        
+                        If StrComp(fieldID, FIELD_CAM, vbTextCompare) = 0 Then
+                            outWs.Cells(taskDict(taskID), 3).Value = customWs.Cells(r, cValCol).Value   ' CAM
+                        ElseIf StrComp(fieldID, FIELD_IPT, vbTextCompare) = 0 Then
+                            outWs.Cells(taskDict(taskID), 4).Value = customWs.Cells(r, cValCol).Value   ' IPT
+                        End If
+                    End If
+                End If
+            Next r
+        Else
+            MsgBox "Tab '" & CUSTOM_SHEET & "' was found but one or more of these headers is missing:" & vbNewLine & _
+                   "'" & HDR_TASK_ID & "', '" & HDR_CUSTOM_FIELD_ID & "', '" & HDR_CUSTOM_VALUE & "'" & vbNewLine & vbNewLine & _
+                   "CAM and IPT columns will be left blank.", vbExclamation
+        End If
+    Else
+        MsgBox "Tab '" & CUSTOM_SHEET & "' was not found. CAM and IPT columns will be left blank.", vbExclamation
+    End If
+    
+    ' =====================================================
+    ' 6. For each monthly tab, add Start/Finish columns
+    ' =====================================================
+    Dim startCol As Long, finishCol As Long
+    Dim outStartCol As Long, outFinishCol As Long
+    Dim s As Long
+    
+    outStartCol = 5   ' first pair of columns goes in E and F (after CAM and IPT)
+    
+    For s = 1 To sheetCount
+        Set ws = sheetArr(s)
+        
+        idCol = FindHeader(ws, HDR_TASK_ID)
+        startCol = FindHeader(ws, HDR_START)
+        finishCol = FindHeader(ws, HDR_FINISH)
+        
+        outFinishCol = outStartCol + 1
+        outWs.Cells(1, outStartCol).Value = ws.Name & " Start"
+        outWs.Cells(1, outFinishCol).Value = ws.Name & " Finish"
+        
+        If idCol > 0 Then
+            lastRow = ws.Cells(ws.Rows.Count, idCol).End(xlUp).Row
+            
+            For r = 2 To lastRow
+                taskID = Trim(CStr(ws.Cells(r, idCol).Value))
+                If Len(taskID) > 0 Then
+                    If taskDict.Exists(taskID) Then
+                        If startCol > 0 Then
+                            outWs.Cells(taskDict(taskID), outStartCol).Value = ws.Cells(r, startCol).Value
+                        End If
+                        If finishCol > 0 Then
+                            outWs.Cells(taskDict(taskID), outFinishCol).Value = ws.Cells(r, finishCol).Value
+                        End If
+                    End If
+                End If
+            Next r
+        End If
+        
+        ' Format the new columns as dates
+        outWs.Range(outWs.Cells(2, outStartCol), outWs.Cells(outRow - 1, outFinishCol)).NumberFormat = "mm/dd/yyyy"
+        
+        outStartCol = outStartCol + 2
+    Next s
+    
+    ' =====================================================
+    ' 7. Final formatting
+    ' =====================================================
+    With outWs.Range(outWs.Cells(1, 1), outWs.Cells(1, outStartCol - 1))
+        .Font.Bold = True
+        .Interior.Color = RGB(217, 225, 242)
+    End With
+    outWs.Columns.AutoFit
+    outWs.Rows(1).AutoFilter
+    
+    MsgBox "Consolidation complete!" & vbNewLine & _
+           taskDict.Count & " unique tasks pulled from earliest tab (" & earliestWs.Name & ")" & vbNewLine & _
+           sheetCount & " monthly tabs processed." & vbNewLine & _
+           IIf(customFound, "CAM/IPT values applied from '" & CUSTOM_SHEET & "'.", _
+               "CAM/IPT values NOT applied (see earlier warning)."), vbInformation
+
+End Sub
+
+' --- Converts an "mm-yyyy" sheet name into a real date for sorting ---
+Private Function SheetDate(sheetName As String) As Date
+    SheetDate = DateSerial(CLng(Right(sheetName, 4)), CLng(Left(sheetName, 2)), 1)
+End Function
+
+' --- Finds a header in row 1; tries an exact match first, then a partial match ---
+Private Function FindHeader(ws As Worksheet, headerText As String) As Long
+    Dim c As Range, lastCol As Long
+    lastCol = ws.Cells(1, ws.Columns.Count).End(xlToLeft).Column
+    
+    ' Exact match
+    For Each c In ws.Range(ws.Cells(1, 1), ws.Cells(1, lastCol))
+        If StrComp(Trim(CStr(c.Value)), headerText, vbTextCompare) = 0 Then
+            FindHeader = c.Column
+            Exit Function
+        End If
+    Next c
+    
+    ' Partial match fallback
+    For Each c In ws.Range(ws.Cells(1, 1), ws.Cells(1, lastCol))
+        If InStr(1, CStr(c.Value), headerText, vbTextCompare) > 0 Then
+            FindHeader = c.Column
+            Exit Function
+        End If
+    Next c
+    
+    FindHeader = 0
+End Function
