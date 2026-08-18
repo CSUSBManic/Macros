@@ -1,0 +1,292 @@
+Option Explicit
+
+Sub Multi_Sandpile_WindowAnalysis()
+
+    Const SRC_SHEET As String = "Consolidated SPD Data"
+    Const TABLE_SHEET As String = "Sandpile Task Table"
+    Const CHART_SHEET As String = "Sandpile Chart"
+    
+    Const HDR_TASK_ID As String = "Task ID"
+    Const HDR_TASK_NAME As String = "Task Name"
+
+    Dim srcWs As Worksheet
+    On Error Resume Next
+    Set srcWs = ThisWorkbook.Worksheets(SRC_SHEET)
+    On Error GoTo 0
+    If srcWs Is Nothing Then Set srcWs = ActiveSheet
+    
+    ' =====================================================
+    ' 1. Prompt the user for the Sandpile window
+    ' =====================================================
+    Dim winStart As Date, winFinish As Date, tmpDate As Date
+    
+    If Not PromptForDateSP("Enter the Sandpile Window START date (e.g. 01/01/2026):", winStart) Then Exit Sub
+    If Not PromptForDateSP("Enter the Sandpile Window FINISH date (e.g. 06/30/2026):", winFinish) Then Exit Sub
+    
+    If winFinish < winStart Then      ' swap if entered backwards
+        tmpDate = winStart
+        winStart = winFinish
+        winFinish = tmpDate
+    End If
+    
+    ' =====================================================
+    ' 2. Locate the mm-yyyy Finish columns & sort chronologically
+    ' =====================================================
+    Dim lastCol As Long, c As Long
+    lastCol = srcWs.Cells(1, srcWs.Columns.Count).End(xlToLeft).Column
+    
+    Dim finCols() As Long, finDates() As Date, finNames() As String, finCount As Long
+    Dim hdr As String
+    finCount = 0
+    
+    For c = 1 To lastCol
+        hdr = Trim(CStr(srcWs.Cells(1, c).Value))
+        If hdr Like "##-#### Finish" Then
+            If IsDate("01-" & Left(hdr, 7)) Then
+                finCount = finCount + 1
+                ReDim Preserve finCols(1 To finCount)
+                ReDim Preserve finDates(1 To finCount)
+                ReDim Preserve finNames(1 To finCount)
+                finCols(finCount) = c
+                finDates(finCount) = DateSerial(CLng(Mid(hdr, 4, 4)), CLng(Left(hdr, 2)), 1)
+                finNames(finCount) = Left(hdr, 7)          ' e.g. "01-2026"
+            End If
+        End If
+    Next c
+    
+    If finCount = 0 Then
+        MsgBox "No columns found with headers like 'mm-yyyy Finish' on sheet '" & srcWs.Name & "'.", vbCritical
+        Exit Sub
+    End If
+    
+    Dim i As Long, j As Long, tmpL As Long, tmpD As Date, tmpS As String
+    For i = 1 To finCount - 1
+        For j = i + 1 To finCount
+            If finDates(j) < finDates(i) Then
+                tmpD = finDates(i): finDates(i) = finDates(j): finDates(j) = tmpD
+                tmpL = finCols(i): finCols(i) = finCols(j): finCols(j) = tmpL
+                tmpS = finNames(i): finNames(i) = finNames(j): finNames(j) = tmpS
+            End If
+        Next j
+    Next i
+    
+    ' =====================================================
+    ' 3. Locate ID / Name columns
+    ' =====================================================
+    Dim idCol As Long, nameCol As Long
+    idCol = FindHeaderSP(srcWs, HDR_TASK_ID)
+    nameCol = FindHeaderSP(srcWs, HDR_TASK_NAME)
+    If nameCol = 0 Then nameCol = FindHeaderSP(srcWs, "Name")
+    
+    If idCol = 0 Then
+        MsgBox "Could not find a '" & HDR_TASK_ID & "' column on sheet '" & srcWs.Name & "'.", vbCritical
+        Exit Sub
+    End If
+    
+    ' =====================================================
+    ' 4. Rebuild the output sheets
+    ' =====================================================
+    Application.DisplayAlerts = False
+    On Error Resume Next
+    ThisWorkbook.Worksheets(TABLE_SHEET).Delete
+    ThisWorkbook.Worksheets(CHART_SHEET).Delete
+    On Error GoTo 0
+    Application.DisplayAlerts = True
+    
+    Dim tblWs As Worksheet, chWs As Worksheet
+    Set tblWs = ThisWorkbook.Worksheets.Add(After:=srcWs)
+    tblWs.Name = TABLE_SHEET
+    Set chWs = ThisWorkbook.Worksheets.Add(After:=tblWs)
+    chWs.Name = CHART_SHEET
+    
+    ' --- Flattened (drillable) table headers: one row per task per snapshot ---
+    tblWs.Cells(1, 1).Value = "Task ID"
+    tblWs.Cells(1, 2).Value = "Task Name"
+    tblWs.Cells(1, 3).Value = "Snapshot"        ' which mm-yyyy column the date came from
+    tblWs.Cells(1, 4).Value = "Finish Date"
+    tblWs.Cells(1, 5).Value = "Finish Month"
+    
+    ' =====================================================
+    ' 5. Flatten: one row per task per monthly Finish value in the window
+    ' =====================================================
+    Dim lastRow As Long, r As Long, outRow As Long
+    Dim v As Variant
+    Dim taskDict As Object                       ' tracks unique tasks that qualified
+    Set taskDict = CreateObject("Scripting.Dictionary")
+    taskDict.CompareMode = vbTextCompare
+    
+    lastRow = srcWs.Cells(srcWs.Rows.Count, idCol).End(xlUp).Row
+    outRow = 2
+    
+    For r = 2 To lastRow
+        For i = 1 To finCount
+            v = srcWs.Cells(r, finCols(i)).Value
+            If IsDate(v) Then
+                If CDate(v) >= winStart And CDate(v) <= winFinish Then
+                    tblWs.Cells(outRow, 1).Value = srcWs.Cells(r, idCol).Value
+                    If nameCol > 0 Then tblWs.Cells(outRow, 2).Value = srcWs.Cells(r, nameCol).Value
+                    tblWs.Cells(outRow, 3).Value = finNames(i)
+                    tblWs.Cells(outRow, 4).Value = CDate(v)
+                    tblWs.Cells(outRow, 5).Value = DateSerial(Year(CDate(v)), Month(CDate(v)), 1)
+                    outRow = outRow + 1
+                    
+                    If Not taskDict.Exists(CStr(srcWs.Cells(r, idCol).Value)) Then
+                        taskDict.Add CStr(srcWs.Cells(r, idCol).Value), r
+                    End If
+                End If
+            End If
+        Next i
+    Next r
+    
+    If outRow = 2 Then
+        MsgBox "No tasks found with any monthly Finish between " & _
+               Format(winStart, "mm/dd/yyyy") & " and " & Format(winFinish, "mm/dd/yyyy") & ".", vbExclamation
+        Exit Sub
+    End If
+    
+    ' --- Format & convert to an Excel Table ---
+    tblWs.Range(tblWs.Cells(2, 4), tblWs.Cells(outRow - 1, 4)).NumberFormat = "mm/dd/yyyy"
+    tblWs.Range(tblWs.Cells(2, 5), tblWs.Cells(outRow - 1, 5)).NumberFormat = "mm-yyyy"
+    
+    Dim lo As ListObject
+    Set lo = tblWs.ListObjects.Add(xlSrcRange, _
+             tblWs.Range(tblWs.Cells(1, 1), tblWs.Cells(outRow - 1, 5)), , xlYes)
+    lo.Name = "tblSandpile"
+    lo.TableStyle = "TableStyleMedium2"
+    
+    ' =====================================================
+    ' 5b. Wide-format reference table (one row per task) to the right
+    ' =====================================================
+    Dim refStartCol As Long
+    refStartCol = 7
+    
+    tblWs.Cells(1, refStartCol).Value = "Task ID"
+    tblWs.Cells(1, refStartCol + 1).Value = "Task Name"
+    For i = 1 To finCount
+        tblWs.Cells(1, refStartCol + 1 + i).Value = srcWs.Cells(1, finCols(i)).Value
+    Next i
+    tblWs.Range(tblWs.Cells(1, refStartCol), tblWs.Cells(1, refStartCol + 1 + finCount)).Font.Bold = True
+    tblWs.Range(tblWs.Cells(1, refStartCol), tblWs.Cells(1, refStartCol + 1 + finCount)).Interior.Color = RGB(217, 225, 242)
+    
+    Dim refRow As Long, k As Variant
+    refRow = 2
+    For Each k In taskDict.Keys
+        r = taskDict(k)
+        tblWs.Cells(refRow, refStartCol).Value = srcWs.Cells(r, idCol).Value
+        If nameCol > 0 Then tblWs.Cells(refRow, refStartCol + 1).Value = srcWs.Cells(r, nameCol).Value
+        For i = 1 To finCount
+            tblWs.Cells(refRow, refStartCol + 1 + i).Value = srcWs.Cells(r, finCols(i)).Value
+        Next i
+        refRow = refRow + 1
+    Next k
+    If refRow > 2 Then
+        tblWs.Range(tblWs.Cells(2, refStartCol + 2), tblWs.Cells(refRow - 1, refStartCol + 1 + finCount)).NumberFormat = "mm/dd/yyyy"
+    End If
+    
+    tblWs.Columns.AutoFit
+    
+    ' =====================================================
+    ' 6. Build the PivotTable (drill-down enabled)
+    ' =====================================================
+    Dim pc As PivotCache, pt As PivotTable
+    Set pc = ThisWorkbook.PivotCaches.Create(SourceType:=xlDatabase, SourceData:="tblSandpile")
+    Set pt = pc.CreatePivotTable(TableDestination:=chWs.Range("A3"), TableName:="ptSandpile")
+    
+    With pt
+        With .PivotFields("Finish Month")
+            .Orientation = xlRowField
+            .NumberFormat = "mm-yyyy"
+        End With
+        .PivotFields("Snapshot").Orientation = xlColumnField
+        .AddDataField .PivotFields("Task ID"), "Task Count", xlCount
+        .ColumnGrand = True
+        .RowGrand = True
+    End With
+    
+    ' --- Force snapshot columns into chronological order ---
+    On Error Resume Next
+    For i = 1 To finCount
+        pt.PivotFields("Snapshot").PivotItems(finNames(i)).Position = i
+    Next i
+    On Error GoTo 0
+    
+    ' =====================================================
+    ' 7. Build the clustered (multi-bar) chart
+    ' =====================================================
+    Dim shp As Shape, ch As Chart
+    Set shp = chWs.Shapes.AddChart2(XlChartType:=xlColumnClustered)
+    Set ch = shp.Chart
+    ch.SetSourceData pt.TableRange1
+    
+    shp.Left = chWs.Range("H2").Left
+    shp.Top = chWs.Range("H2").Top
+    shp.Width = 750
+    shp.Height = 440
+    
+    With ch
+        .HasTitle = True
+        .ChartTitle.Text = "Sandpile Window: " & Format(winStart, "mm/dd/yyyy") & " - " & _
+                           Format(winFinish, "mm/dd/yyyy") & "  (Task Finishes by Month, per Snapshot)"
+        .Axes(xlCategory).HasTitle = True
+        .Axes(xlCategory).AxisTitle.Text = "Finish Month (mm-yyyy)"
+        .Axes(xlValue).HasTitle = True
+        .Axes(xlValue).AxisTitle.Text = "Task Count"
+        .HasLegend = True
+        .Legend.Position = xlLegendPositionBottom
+        On Error Resume Next
+        .ShowAllFieldButtons = False
+        On Error GoTo 0
+    End With
+    
+    chWs.Range("A1").Value = "Sandpile Analysis - double-click any pivot value to drill down to its tasks"
+    chWs.Range("A1").Font.Bold = True
+    chWs.Columns("A:G").AutoFit
+    
+    MsgBox "Sandpile analysis complete!" & vbNewLine & vbNewLine & _
+           taskDict.Count & " unique tasks have at least one monthly Finish in the window." & vbNewLine & _
+           (outRow - 2) & " task/snapshot date entries plotted." & vbNewLine & _
+           finCount & " monthly snapshot columns included." & vbNewLine & vbNewLine & _
+           "Tip: double-click any count in the PivotTable on '" & CHART_SHEET & _
+           "' to drill down to the underlying tasks.", vbInformation
+
+End Sub
+
+' --- Prompts until a valid date is entered; returns False if user cancels ---
+Private Function PromptForDateSP(promptText As String, ByRef result As Date) As Boolean
+    Dim s As String
+    Do
+        s = InputBox(promptText, "Sandpile Window")
+        If Len(s) = 0 Then
+            PromptForDateSP = False
+            Exit Function
+        End If
+        If IsDate(s) Then
+            result = CDate(s)
+            PromptForDateSP = True
+            Exit Function
+        End If
+        MsgBox "'" & s & "' is not a valid date. Please try again.", vbExclamation
+    Loop
+End Function
+
+' --- Finds a header in row 1 (exact match, then partial) ---
+Private Function FindHeaderSP(ws As Worksheet, headerText As String) As Long
+    Dim c As Range, lastCol As Long
+    lastCol = ws.Cells(1, ws.Columns.Count).End(xlToLeft).Column
+    
+    For Each c In ws.Range(ws.Cells(1, 1), ws.Cells(1, lastCol))
+        If StrComp(Trim(CStr(c.Value)), headerText, vbTextCompare) = 0 Then
+            FindHeaderSP = c.Column
+            Exit Function
+        End If
+    Next c
+    
+    For Each c In ws.Range(ws.Cells(1, 1), ws.Cells(1, lastCol))
+        If InStr(1, CStr(c.Value), headerText, vbTextCompare) > 0 Then
+            FindHeaderSP = c.Column
+            Exit Function
+        End If
+    Next c
+    
+    FindHeaderSP = 0
+End Function
