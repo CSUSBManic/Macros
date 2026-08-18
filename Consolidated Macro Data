@@ -2,165 +2,189 @@ Option Explicit
 
 Sub ConsolidateSPDData()
 
-    '=================== CONFIGURATION ===================
     Const OUTPUT_SHEET As String = "Consolidated SPD Data"
+    
+    ' --- Header names to look for in each monthly tab (edit these to match your export) ---
     Const HDR_TASK_ID As String = "Task ID"
-    Const HDR_TASK_NAME As String = "Name"          ' Also checks "Task Name" as fallback
+    Const HDR_TASK_NAME As String = "Name"
     Const HDR_START As String = "Current Start Date"
     Const HDR_FINISH As String = "Current Finish Date"
-    '=====================================================
 
-    Dim wb As Workbook
-    Dim ws As Worksheet, wsOut As Worksheet
-    Dim monthTabs As Collection
-    Dim taskDict As Object          ' Task ID -> row number on output sheet
+    Dim ws As Worksheet, outWs As Worksheet
     Dim i As Long, j As Long
-    Dim lastRow As Long, outRow As Long, outCol As Long
-    Dim colID As Long, colName As Long, colStart As Long, colFinish As Long
-    Dim taskID As Variant
-
-    Set wb = ThisWorkbook
-    Set taskDict = CreateObject("Scripting.Dictionary")
-    taskDict.CompareMode = vbTextCompare
-    Set monthTabs = New Collection
-
-    Application.ScreenUpdating = False
-    Application.Calculation = xlCalculationManual
-
-    '--- Collect all tabs named in mm-yyyy format, sorted chronologically ---
-    Dim tabNames() As String, tabDates() As Date, tabCount As Long
-    ReDim tabNames(1 To wb.Worksheets.Count)
-    ReDim tabDates(1 To wb.Worksheets.Count)
-    tabCount = 0
-
-    For Each ws In wb.Worksheets
-        If ws.Name Like "##-####" Then
-            If IsNumeric(Left(ws.Name, 2)) And IsNumeric(Right(ws.Name, 4)) Then
-                tabCount = tabCount + 1
-                tabNames(tabCount) = ws.Name
-                tabDates(tabCount) = DateSerial(CLng(Right(ws.Name, 4)), CLng(Left(ws.Name, 2)), 1)
-            End If
+    
+    ' =====================================================
+    ' 1. Collect all mm-yyyy sheets
+    ' =====================================================
+    Dim sheetArr() As Worksheet
+    Dim sheetCount As Long
+    sheetCount = 0
+    
+    For Each ws In ThisWorkbook.Worksheets
+        If ws.Name Like "##-####" And IsDate("01-" & ws.Name) Then
+            sheetCount = sheetCount + 1
+            ReDim Preserve sheetArr(1 To sheetCount)
+            Set sheetArr(sheetCount) = ws
         End If
     Next ws
-
-    If tabCount = 0 Then
+    
+    If sheetCount = 0 Then
         MsgBox "No tabs found with mm-yyyy naming format.", vbExclamation
-        GoTo CleanUp
+        Exit Sub
     End If
-
-    '--- Simple sort of the tabs by date ---
-    Dim tmpName As String, tmpDate As Date
-    For i = 1 To tabCount - 1
-        For j = i + 1 To tabCount
-            If tabDates(j) < tabDates(i) Then
-                tmpDate = tabDates(i): tabDates(i) = tabDates(j): tabDates(j) = tmpDate
-                tmpName = tabNames(i): tabNames(i) = tabNames(j): tabNames(j) = tmpName
+    
+    ' =====================================================
+    ' 2. Sort sheets chronologically (earliest first)
+    ' =====================================================
+    Dim tmp As Worksheet
+    For i = 1 To sheetCount - 1
+        For j = i + 1 To sheetCount
+            If SheetDate(sheetArr(j).Name) < SheetDate(sheetArr(i).Name) Then
+                Set tmp = sheetArr(i)
+                Set sheetArr(i) = sheetArr(j)
+                Set sheetArr(j) = tmp
             End If
         Next j
     Next i
-
-    '--- Delete existing output sheet if present, then create fresh ---
+    
+    Dim earliestWs As Worksheet
+    Set earliestWs = sheetArr(1)
+    
+    ' =====================================================
+    ' 3. Create (or recreate) the output sheet
+    ' =====================================================
     Application.DisplayAlerts = False
     On Error Resume Next
-    wb.Worksheets(OUTPUT_SHEET).Delete
+    ThisWorkbook.Worksheets(OUTPUT_SHEET).Delete
     On Error GoTo 0
     Application.DisplayAlerts = True
-
-    Set wsOut = wb.Worksheets.Add(Before:=wb.Worksheets(1))
-    wsOut.Name = OUTPUT_SHEET
-
-    '--- Build header row ---
-    wsOut.Cells(1, 1).Value = HDR_TASK_ID
-    wsOut.Cells(1, 2).Value = HDR_TASK_NAME
-    outCol = 3
-    For i = 1 To tabCount
-        wsOut.Cells(1, outCol).Value = tabNames(i) & " Start"
-        wsOut.Cells(1, outCol + 1).Value = tabNames(i) & " Finish"
-        outCol = outCol + 2
-    Next i
-    wsOut.Rows(1).Font.Bold = True
-
-    '--- Loop through each month tab and populate data ---
-    outRow = 1  ' Header row; data starts at row 2
-
-    For i = 1 To tabCount
-        Set ws = wb.Worksheets(tabNames(i))
-
-        ' Locate required columns by header name (searches row 1)
-        colID = FindHeaderColumn(ws, HDR_TASK_ID)
-        colName = FindHeaderColumn(ws, HDR_TASK_NAME)
-        If colName = 0 Then colName = FindHeaderColumn(ws, "Task Name")
-        colStart = FindHeaderColumn(ws, HDR_START)
-        colFinish = FindHeaderColumn(ws, HDR_FINISH)
-
-        If colID = 0 Or colFinish = 0 Then
-            MsgBox "Tab '" & ws.Name & "' is missing the '" & HDR_TASK_ID & _
-                   "' or '" & HDR_FINISH & "' column and will be skipped.", vbExclamation
-            GoTo NextTab
-        End If
-
-        lastRow = ws.Cells(ws.Rows.Count, colID).End(xlUp).Row
-
-        ' Column positions on the output sheet for this tab
-        Dim outStartCol As Long, outFinishCol As Long
-        outStartCol = 3 + (i - 1) * 2
-        outFinishCol = outStartCol + 1
-
-        For j = 2 To lastRow
-            taskID = ws.Cells(j, colID).Value
-            If Len(Trim(CStr(taskID))) > 0 Then
-
-                ' Add task to the output sheet if it's new
-                If Not taskDict.Exists(CStr(taskID)) Then
-                    outRow = outRow + 1
-                    taskDict.Add CStr(taskID), outRow
-                    wsOut.Cells(outRow, 1).Value = taskID
-                    If colName > 0 Then wsOut.Cells(outRow, 2).Value = ws.Cells(j, colName).Value
-                End If
-
-                ' Write Start and Finish dates into this tab's columns
-                Dim r As Long
-                r = taskDict(CStr(taskID))
-                If colStart > 0 Then wsOut.Cells(r, outStartCol).Value = ws.Cells(j, colStart).Value
-                wsOut.Cells(r, outFinishCol).Value = ws.Cells(j, colFinish).Value
-
-                ' Fill in the Name if it was blank when the task was first seen
-                If wsOut.Cells(r, 2).Value = "" And colName > 0 Then
-                    wsOut.Cells(r, 2).Value = ws.Cells(j, colName).Value
-                End If
+    
+    Set outWs = ThisWorkbook.Worksheets.Add(Before:=ThisWorkbook.Worksheets(1))
+    outWs.Name = OUTPUT_SHEET
+    
+    ' =====================================================
+    ' 4. Build the unique Task ID list from the earliest tab
+    ' =====================================================
+    Dim idCol As Long, nameCol As Long
+    idCol = FindHeader(earliestWs, HDR_TASK_ID)
+    nameCol = FindHeader(earliestWs, HDR_TASK_NAME)
+    
+    If idCol = 0 Or nameCol = 0 Then
+        MsgBox "Could not find '" & HDR_TASK_ID & "' and/or '" & HDR_TASK_NAME & _
+               "' headers on tab '" & earliestWs.Name & "'.", vbCritical
+        Exit Sub
+    End If
+    
+    Dim taskDict As Object
+    Set taskDict = CreateObject("Scripting.Dictionary")
+    taskDict.CompareMode = vbTextCompare
+    
+    outWs.Cells(1, 1).Value = "Task ID"
+    outWs.Cells(1, 2).Value = "Task Name"
+    
+    Dim lastRow As Long, r As Long, outRow As Long
+    Dim taskID As String
+    
+    lastRow = earliestWs.Cells(earliestWs.Rows.Count, idCol).End(xlUp).Row
+    outRow = 2
+    
+    For r = 2 To lastRow
+        taskID = Trim(CStr(earliestWs.Cells(r, idCol).Value))
+        If Len(taskID) > 0 Then
+            If Not taskDict.Exists(taskID) Then
+                taskDict.Add taskID, outRow                  ' store the output row for this ID
+                outWs.Cells(outRow, 1).Value = taskID
+                outWs.Cells(outRow, 2).Value = earliestWs.Cells(r, nameCol).Value
+                outRow = outRow + 1
             End If
-        Next j
-
-NextTab:
-    Next i
-
-    '--- Formatting ---
-    With wsOut
-        .Range(.Cells(2, 3), .Cells(outRow, 2 + tabCount * 2)).NumberFormat = "mm/dd/yyyy"
-        .Columns.AutoFit
-        .Rows(1).AutoFilter
-        .Activate
-        .Range("A2").Select
-        ActiveWindow.FreezePanes = True
+        End If
+    Next r
+    
+    ' =====================================================
+    ' 5. For each monthly tab, add Start/Finish columns
+    ' =====================================================
+    Dim startCol As Long, finishCol As Long
+    Dim outStartCol As Long, outFinishCol As Long
+    Dim s As Long
+    
+    outStartCol = 3   ' first pair of columns goes in C and D
+    
+    For s = 1 To sheetCount
+        Set ws = sheetArr(s)
+        
+        idCol = FindHeader(ws, HDR_TASK_ID)
+        startCol = FindHeader(ws, HDR_START)
+        finishCol = FindHeader(ws, HDR_FINISH)
+        
+        outFinishCol = outStartCol + 1
+        outWs.Cells(1, outStartCol).Value = ws.Name & " Start"
+        outWs.Cells(1, outFinishCol).Value = ws.Name & " Finish"
+        
+        If idCol > 0 Then
+            lastRow = ws.Cells(ws.Rows.Count, idCol).End(xlUp).Row
+            
+            For r = 2 To lastRow
+                taskID = Trim(CStr(ws.Cells(r, idCol).Value))
+                If Len(taskID) > 0 Then
+                    If taskDict.Exists(taskID) Then
+                        If startCol > 0 Then
+                            outWs.Cells(taskDict(taskID), outStartCol).Value = ws.Cells(r, startCol).Value
+                        End If
+                        If finishCol > 0 Then
+                            outWs.Cells(taskDict(taskID), outFinishCol).Value = ws.Cells(r, finishCol).Value
+                        End If
+                    End If
+                End If
+            Next r
+        End If
+        
+        ' Format the new columns as dates
+        outWs.Range(outWs.Cells(2, outStartCol), outWs.Cells(outRow - 1, outFinishCol)).NumberFormat = "mm/dd/yyyy"
+        
+        outStartCol = outStartCol + 2
+    Next s
+    
+    ' =====================================================
+    ' 6. Final formatting
+    ' =====================================================
+    With outWs.Range(outWs.Cells(1, 1), outWs.Cells(1, outStartCol - 1))
+        .Font.Bold = True
+        .Interior.Color = RGB(217, 225, 242)
     End With
-
-    MsgBox "Consolidation complete!" & vbCrLf & _
-           taskDict.Count & " unique tasks across " & tabCount & " monthly tabs.", vbInformation
-
-CleanUp:
-    Application.Calculation = xlCalculationAutomatic
-    Application.ScreenUpdating = True
+    outWs.Columns.AutoFit
+    outWs.Rows(1).AutoFilter
+    
+    MsgBox "Consolidation complete!" & vbNewLine & _
+           taskDict.Count & " unique tasks pulled from earliest tab (" & earliestWs.Name & ")" & vbNewLine & _
+           sheetCount & " monthly tabs processed.", vbInformation
 
 End Sub
 
-' Helper: returns the column number of a header in row 1, or 0 if not found
-Private Function FindHeaderColumn(ws As Worksheet, headerText As String) As Long
-    Dim found As Range
-    Set found = ws.Rows(1).Find(What:=headerText, LookIn:=xlValues, _
-                                LookAt:=xlWhole, MatchCase:=False)
-    If Not found Is Nothing Then
-        FindHeaderColumn = found.Column
-    Else
-        FindHeaderColumn = 0
-    End If
+' --- Converts an "mm-yyyy" sheet name into a real date for sorting ---
+Private Function SheetDate(sheetName As String) As Date
+    SheetDate = DateSerial(CLng(Right(sheetName, 4)), CLng(Left(sheetName, 2)), 1)
+End Function
+
+' --- Finds a header in row 1; tries an exact match first, then a partial match ---
+Private Function FindHeader(ws As Worksheet, headerText As String) As Long
+    Dim c As Range, lastCol As Long
+    lastCol = ws.Cells(1, ws.Columns.Count).End(xlToLeft).Column
+    
+    ' Exact match
+    For Each c In ws.Range(ws.Cells(1, 1), ws.Cells(1, lastCol))
+        If StrComp(Trim(CStr(c.Value)), headerText, vbTextCompare) = 0 Then
+            FindHeader = c.Column
+            Exit Function
+        End If
+    Next c
+    
+    ' Partial match fallback
+    For Each c In ws.Range(ws.Cells(1, 1), ws.Cells(1, lastCol))
+        If InStr(1, CStr(c.Value), headerText, vbTextCompare) > 0 Then
+            FindHeader = c.Column
+            Exit Function
+        End If
+    Next c
+    
+    FindHeader = 0
 End Function
