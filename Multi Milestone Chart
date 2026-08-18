@@ -1,0 +1,339 @@
+Option Explicit
+
+Sub Milestone_ComparisonChart()
+
+    Const SRC_SHEET As String = "Consolidated SPD Data"
+    Const OUT_SHEET As String = "Milestone Compare"
+    Const MAX_TASKS As Long = 10
+    
+    Const HDR_TASK_ID As String = "Task ID"
+    Const HDR_TASK_NAME As String = "Task Name"
+
+    Dim srcWs As Worksheet
+    On Error Resume Next
+    Set srcWs = ThisWorkbook.Worksheets(SRC_SHEET)
+    On Error GoTo 0
+    If srcWs Is Nothing Then Set srcWs = ActiveSheet
+    
+    ' =====================================================
+    ' 1. Locate the mm-yyyy Finish columns & sort chronologically
+    ' =====================================================
+    Dim lastCol As Long, c As Long
+    lastCol = srcWs.Cells(1, srcWs.Columns.Count).End(xlToLeft).Column
+    
+    Dim finCols() As Long, finDates() As Date, finNames() As String, finCount As Long
+    Dim hdr As String
+    finCount = 0
+    
+    For c = 1 To lastCol
+        hdr = Trim(CStr(srcWs.Cells(1, c).Value))
+        If hdr Like "##-#### Finish" Then
+            If IsDate("01-" & Left(hdr, 7)) Then
+                finCount = finCount + 1
+                ReDim Preserve finCols(1 To finCount)
+                ReDim Preserve finDates(1 To finCount)
+                ReDim Preserve finNames(1 To finCount)
+                finCols(finCount) = c
+                finDates(finCount) = DateSerial(CLng(Mid(hdr, 4, 4)), CLng(Left(hdr, 2)), 1)
+                finNames(finCount) = Left(hdr, 7)
+            End If
+        End If
+    Next c
+    
+    If finCount = 0 Then
+        MsgBox "No columns found with headers like 'mm-yyyy Finish' on sheet '" & srcWs.Name & "'.", vbCritical
+        Exit Sub
+    End If
+    
+    Dim i As Long, j As Long, tmpL As Long, tmpD As Date, tmpS As String
+    For i = 1 To finCount - 1
+        For j = i + 1 To finCount
+            If finDates(j) < finDates(i) Then
+                tmpD = finDates(i): finDates(i) = finDates(j): finDates(j) = tmpD
+                tmpL = finCols(i): finCols(i) = finCols(j): finCols(j) = tmpL
+                tmpS = finNames(i): finNames(i) = finNames(j): finNames(j) = tmpS
+            End If
+        Next j
+    Next i
+    
+    ' =====================================================
+    ' 2. Locate ID / Name columns
+    ' =====================================================
+    Dim idCol As Long, nameCol As Long
+    idCol = FindHeaderMS(srcWs, HDR_TASK_ID)
+    nameCol = FindHeaderMS(srcWs, HDR_TASK_NAME)
+    If nameCol = 0 Then nameCol = FindHeaderMS(srcWs, "Name")
+    
+    If idCol = 0 Then
+        MsgBox "Could not find a '" & HDR_TASK_ID & "' column on sheet '" & srcWs.Name & "'.", vbCritical
+        Exit Sub
+    End If
+    
+    ' =====================================================
+    ' 3. Prompt for up to 10 Task IDs (comma-separated)
+    ' =====================================================
+    Dim rawInput As String
+    rawInput = InputBox("Enter up to " & MAX_TASKS & " Task IDs, separated by commas:" & vbNewLine & vbNewLine & _
+                        "Example:  A1010, A1040, B2200", "Milestone Comparison")
+    If Len(Trim(rawInput)) = 0 Then Exit Sub
+    
+    rawInput = Replace(rawInput, ";", ",")
+    Dim parts() As String
+    parts = Split(rawInput, ",")
+    
+    Dim reqIDs() As String, reqCount As Long
+    ReDim reqIDs(1 To MAX_TASKS)
+    reqCount = 0
+    
+    For i = LBound(parts) To UBound(parts)
+        If Len(Trim(parts(i))) > 0 Then
+            If reqCount = MAX_TASKS Then
+                MsgBox "More than " & MAX_TASKS & " IDs entered - only the first " & MAX_TASKS & " will be used.", vbExclamation
+                Exit For
+            End If
+            reqCount = reqCount + 1
+            reqIDs(reqCount) = Trim(parts(i))
+        End If
+    Next i
+    
+    If reqCount = 0 Then Exit Sub
+    
+    ' --- Find each Task ID's row on the source sheet ---
+    Dim lastRow As Long, r As Long
+    lastRow = srcWs.Cells(srcWs.Rows.Count, idCol).End(xlUp).Row
+    
+    Dim taskRows() As Long, taskNames() As String, foundCount As Long
+    ReDim taskRows(1 To reqCount)
+    ReDim taskNames(1 To reqCount)
+    
+    Dim notFound As String
+    foundCount = 0
+    
+    For i = 1 To reqCount
+        taskRows(i) = 0
+        For r = 2 To lastRow
+            If StrComp(Trim(CStr(srcWs.Cells(r, idCol).Value)), reqIDs(i), vbTextCompare) = 0 Then
+                taskRows(i) = r
+                Exit For
+            End If
+        Next r
+        If taskRows(i) = 0 Then
+            notFound = notFound & vbNewLine & "  - " & reqIDs(i)
+        Else
+            foundCount = foundCount + 1
+            If nameCol > 0 Then
+                taskNames(i) = CStr(srcWs.Cells(taskRows(i), nameCol).Value)
+            Else
+                taskNames(i) = reqIDs(i)
+            End If
+            If Len(Trim(taskNames(i))) = 0 Then taskNames(i) = reqIDs(i)
+        End If
+    Next i
+    
+    If foundCount = 0 Then
+        MsgBox "None of the entered Task IDs were found on sheet '" & srcWs.Name & "'.", vbCritical
+        Exit Sub
+    End If
+    If Len(notFound) > 0 Then
+        MsgBox "The following Task IDs were not found and will be skipped:" & notFound, vbExclamation
+    End If
+    
+    ' =====================================================
+    ' 4. Rebuild the output sheet & lay out the chart data
+    '     One row per found task; one date column per snapshot
+    ' =====================================================
+    Application.DisplayAlerts = False
+    On Error Resume Next
+    ThisWorkbook.Worksheets(OUT_SHEET).Delete
+    On Error GoTo 0
+    Application.DisplayAlerts = True
+    
+    Dim outWs As Worksheet
+    Set outWs = ThisWorkbook.Worksheets.Add(After:=srcWs)
+    outWs.Name = OUT_SHEET
+    
+    outWs.Cells(1, 1).Value = "Task ID"
+    outWs.Cells(1, 2).Value = "Task Name"
+    outWs.Cells(1, 3).Value = "Y"
+    For i = 1 To finCount
+        outWs.Cells(1, 3 + i).Value = finNames(i)
+    Next i
+    outWs.Range(outWs.Cells(1, 1), outWs.Cells(1, 3 + finCount)).Font.Bold = True
+    
+    Dim outRow As Long, yVal As Long, v As Variant
+    Dim minDate As Double, maxDate As Double
+    minDate = 0: maxDate = 0
+    
+    outRow = 2
+    yVal = 0
+    
+    For i = 1 To reqCount
+        If taskRows(i) > 0 Then
+            yVal = yVal + 1
+            outWs.Cells(outRow, 1).Value = reqIDs(i)
+            outWs.Cells(outRow, 2).Value = taskNames(i)
+            outWs.Cells(outRow, 3).Value = yVal
+            For j = 1 To finCount
+                v = srcWs.Cells(taskRows(i), finCols(j)).Value
+                If IsDate(v) Then
+                    outWs.Cells(outRow, 3 + j).Value = CDate(v)
+                    If minDate = 0 Or CDbl(CDate(v)) < minDate Then minDate = CDbl(CDate(v))
+                    If CDbl(CDate(v)) > maxDate Then maxDate = CDbl(CDate(v))
+                End If
+            Next j
+            outRow = outRow + 1
+        End If
+    Next i
+    
+    Dim taskCount As Long
+    taskCount = yVal
+    
+    If minDate = 0 Then
+        MsgBox "The selected tasks have no dates in any monthly Finish column - nothing to chart.", vbExclamation
+        Exit Sub
+    End If
+    
+    outWs.Range(outWs.Cells(2, 4), outWs.Cells(outRow - 1, 3 + finCount)).NumberFormat = "mm/dd/yyyy"
+    outWs.Columns.AutoFit
+    
+    ' --- Date axis padding ---
+    Dim pad As Double
+    pad = (maxDate - minDate) * 0.08
+    If pad < 7 Then pad = 7
+    
+    ' =====================================================
+    ' 5. Build the scatter (milestone) chart
+    ' =====================================================
+    Dim shp As Shape, ch As Chart, srs As Series
+    Set shp = outWs.Shapes.AddChart2(XlChartType:=xlXYScatter)
+    Set ch = shp.Chart
+    
+    Do While ch.SeriesCollection.Count > 0          ' clear any auto-picked series
+        ch.SeriesCollection(1).Delete
+    Loop
+    
+    shp.Left = outWs.Cells(2, 5 + finCount).Left + 20
+    shp.Top = outWs.Cells(2, 1).Top
+    shp.Width = 850
+    shp.Height = 120 + taskCount * 60
+    
+    ' --- One series per monthly snapshot ---
+    For j = 1 To finCount
+        Set srs = ch.SeriesCollection.NewSeries
+        With srs
+            .Name = finNames(j)
+            .XValues = outWs.Range(outWs.Cells(2, 3 + j), outWs.Cells(outRow - 1, 3 + j))
+            .Values = outWs.Range(outWs.Cells(2, 3), outWs.Cells(outRow - 1, 3))
+            .MarkerStyle = xlMarkerStyleDiamond
+            .MarkerSize = 11
+            .Format.Line.Visible = msoFalse
+        End With
+    Next j
+    
+    ' --- Apply DATA CALLOUTS to all snapshot series, then set each
+    '     callout's text to the point's date ---
+    On Error Resume Next
+    ch.SetElement msoElementDataLabelCallout
+    On Error GoTo 0
+    
+    Dim p As Long
+    For j = 1 To finCount
+        Set srs = ch.SeriesCollection(j)
+        If Not srs.HasDataLabels Then srs.ApplyDataLabels
+        For p = 1 To srs.Points.Count
+            v = outWs.Cells(1 + p, 3 + j).Value
+            If IsDate(v) Then
+                srs.Points(p).DataLabel.Text = Format(CDate(v), "mm/dd/yy")
+                srs.Points(p).DataLabel.Font.Size = 8
+            Else
+                On Error Resume Next
+                srs.Points(p).DataLabel.Delete   ' no date = no label
+                On Error GoTo 0
+            End If
+        Next p
+    Next j
+    
+    ' --- Hidden helper series to paint Task Names on the Y axis ---
+    Dim lblSrs As Series
+    Set lblSrs = ch.SeriesCollection.NewSeries
+    Dim xArr() As Double, yArr() As Double
+    ReDim xArr(1 To taskCount)
+    ReDim yArr(1 To taskCount)
+    For i = 1 To taskCount
+        xArr(i) = minDate - pad
+        yArr(i) = i
+    Next i
+    With lblSrs
+        .Name = "TaskLabels"
+        .XValues = xArr
+        .Values = yArr
+        .MarkerStyle = xlMarkerStyleNone
+        .Format.Line.Visible = msoFalse
+        .ApplyDataLabels
+        For i = 1 To taskCount
+            .Points(i).DataLabel.Text = outWs.Cells(1 + i, 2).Value
+            .Points(i).DataLabel.Position = xlLabelPositionRight
+            .Points(i).DataLabel.Font.Bold = True
+            .Points(i).DataLabel.Font.Size = 9
+        Next i
+    End With
+    
+    ' --- Axes, title, legend ---
+    With ch
+        .HasTitle = True
+        .ChartTitle.Text = "Milestone Comparison - Monthly Finish Dates by Snapshot"
+        
+        With .Axes(xlCategory)                       ' X = dates
+            .MinimumScale = minDate - pad
+            .MaximumScale = maxDate + pad
+            .TickLabels.NumberFormat = "mm/dd/yy"
+            .TickLabels.Orientation = 45
+            .HasTitle = True
+            .AxisTitle.Text = "Finish Date"
+            .HasMajorGridlines = True
+        End With
+        
+        With .Axes(xlValue)                          ' Y = task slots
+            .MinimumScale = 0
+            .MaximumScale = taskCount + 1
+            .MajorUnit = 1
+            .ReversePlotOrder = True                 ' first task on top
+            .TickLabelPosition = xlTickLabelPositionNone
+            .HasMajorGridlines = True
+        End With
+        
+        .HasLegend = True
+        .Legend.Position = xlLegendPositionBottom
+    End With
+    
+    ' --- Remove the helper series from the legend ---
+    On Error Resume Next
+    ch.Legend.LegendEntries(ch.Legend.LegendEntries.Count).Delete
+    On Error GoTo 0
+    
+    MsgBox "Milestone comparison complete!" & vbNewLine & vbNewLine & _
+           foundCount & " task(s) charted across " & finCount & " monthly snapshot(s).", vbInformation
+
+End Sub
+
+' --- Finds a header in row 1 (exact match, then partial) ---
+Private Function FindHeaderMS(ws As Worksheet, headerText As String) As Long
+    Dim c As Range, lastCol As Long
+    lastCol = ws.Cells(1, ws.Columns.Count).End(xlToLeft).Column
+    
+    For Each c In ws.Range(ws.Cells(1, 1), ws.Cells(1, lastCol))
+        If StrComp(Trim(CStr(c.Value)), headerText, vbTextCompare) = 0 Then
+            FindHeaderMS = c.Column
+            Exit Function
+        End If
+    Next c
+    
+    For Each c In ws.Range(ws.Cells(1, 1), ws.Cells(1, lastCol))
+        If InStr(1, CStr(c.Value), headerText, vbTextCompare) > 0 Then
+            FindHeaderMS = c.Column
+            Exit Function
+        End If
+    Next c
+    
+    FindHeaderMS = 0
+End Function
