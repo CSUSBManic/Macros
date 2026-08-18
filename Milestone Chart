@@ -1,0 +1,172 @@
+Sub BuildMilestoneComparisonChart()
+
+    Dim wsData As Worksheet
+    Dim wsChart As Worksheet
+    Dim taskIDs(1 To 10) As String
+    Dim taskCount As Integer
+    Dim userInput As String
+    Dim i As Integer
+    
+    Dim colTaskID As Long
+    Dim colOrigFinish As Long
+    Dim colCurrFinish As Long
+    Dim headerRow As Long
+    
+    Dim foundCell As Range
+    Dim origDate As Variant
+    Dim currDate As Variant
+    
+    Set wsData = ActiveSheet
+    headerRow = 1   ' <-- Change if your headers are on a different row
+    
+    '--------------------------------------------------
+    ' 1. Locate the required columns by header name
+    '--------------------------------------------------
+    On Error Resume Next
+    colTaskID = Application.Match("Task ID", wsData.Rows(headerRow), 0)
+    colOrigFinish = Application.Match("Original Finish", wsData.Rows(headerRow), 0)
+    colCurrFinish = Application.Match("Current Month Finish", wsData.Rows(headerRow), 0)
+    On Error GoTo 0
+    
+    If colTaskID = 0 Or colOrigFinish = 0 Or colCurrFinish = 0 Then
+        MsgBox "Could not find one or more required headers on row " & headerRow & ":" & vbCrLf & _
+               "'Task ID', 'Original Finish', 'Current Month Finish'", vbCritical, "Headers Not Found"
+        Exit Sub
+    End If
+    
+    '--------------------------------------------------
+    ' 2. Prompt the user for up to 10 Task IDs
+    '--------------------------------------------------
+    taskCount = 0
+    For i = 1 To 10
+        userInput = InputBox("Enter Task ID #" & i & " of up to 10." & vbCrLf & vbCrLf & _
+                             "Leave blank (or press Cancel) when finished.", _
+                             "Milestone Comparison Chart")
+        If Trim(userInput) = "" Then Exit For
+        taskCount = taskCount + 1
+        taskIDs(taskCount) = Trim(userInput)
+    Next i
+    
+    If taskCount = 0 Then
+        MsgBox "No Task IDs entered. Macro cancelled.", vbInformation
+        Exit Sub
+    End If
+    
+    '--------------------------------------------------
+    ' 3. Create (or replace) the output sheet
+    '--------------------------------------------------
+    Application.DisplayAlerts = False
+    On Error Resume Next
+    ThisWorkbook.Worksheets("Milestone Comparison").Delete
+    On Error GoTo 0
+    Application.DisplayAlerts = True
+    
+    Set wsChart = ThisWorkbook.Worksheets.Add(After:=wsData)
+    wsChart.Name = "Milestone Comparison"
+    
+    wsChart.Range("A1").Value = "Task ID"
+    wsChart.Range("B1").Value = "Original Finish"
+    wsChart.Range("C1").Value = "Current Month Finish"
+    
+    '--------------------------------------------------
+    ' 4. Look up each Task ID and pull the two dates
+    '--------------------------------------------------
+    Dim outRow As Long
+    Dim missingList As String
+    outRow = 2
+    missingList = ""
+    
+    For i = 1 To taskCount
+        Set foundCell = wsData.Columns(colTaskID).Find( _
+                            What:=taskIDs(i), _
+                            LookIn:=xlValues, _
+                            LookAt:=xlWhole, _
+                            MatchCase:=False)
+        
+        If foundCell Is Nothing Then
+            missingList = missingList & vbCrLf & " - " & taskIDs(i)
+        Else
+            origDate = wsData.Cells(foundCell.Row, colOrigFinish).Value
+            currDate = wsData.Cells(foundCell.Row, colCurrFinish).Value
+            
+            wsChart.Cells(outRow, 1).Value = taskIDs(i)
+            If IsDate(origDate) Then wsChart.Cells(outRow, 2).Value = CDate(origDate)
+            If IsDate(currDate) Then wsChart.Cells(outRow, 3).Value = CDate(currDate)
+            outRow = outRow + 1
+        End If
+    Next i
+    
+    If missingList <> "" Then
+        MsgBox "The following Task IDs were not found and will be skipped:" & missingList, _
+               vbExclamation, "Tasks Not Found"
+    End If
+    
+    If outRow = 2 Then
+        MsgBox "None of the entered Task IDs were found. Macro cancelled.", vbCritical
+        Application.DisplayAlerts = False
+        wsChart.Delete
+        Application.DisplayAlerts = True
+        Exit Sub
+    End If
+    
+    Dim lastRow As Long
+    lastRow = outRow - 1
+    
+    wsChart.Range("B2:C" & lastRow).NumberFormat = "mm/dd/yyyy"
+    wsChart.Columns("A:C").AutoFit
+    
+    '--------------------------------------------------
+    ' 5. Build the chart (line chart, lines hidden,
+    '    diamond markers only)
+    '--------------------------------------------------
+    Dim chtObj As ChartObject
+    Dim cht As Chart
+    Dim ser As Series
+    
+    Set chtObj = wsChart.ChartObjects.Add(Left:=250, Top:=20, Width:=600, Height:=400)
+    Set cht = chtObj.Chart
+    
+    cht.ChartType = xlLineMarkers
+    cht.SetSourceData Source:=wsChart.Range("A1:C" & lastRow)
+    
+    ' --- Series 1: Original Finish (blue diamonds) ---
+    Set ser = cht.SeriesCollection(1)
+    ser.Format.Line.Visible = msoFalse          ' hide connecting line
+    ser.MarkerStyle = xlMarkerStyleDiamond
+    ser.MarkerSize = 12
+    ser.MarkerForegroundColor = RGB(0, 51, 153)
+    ser.MarkerBackgroundColor = RGB(0, 112, 192)
+    
+    ' --- Series 2: Current Month Finish (red diamonds) ---
+    Set ser = cht.SeriesCollection(2)
+    ser.Format.Line.Visible = msoFalse
+    ser.MarkerStyle = xlMarkerStyleDiamond
+    ser.MarkerSize = 12
+    ser.MarkerForegroundColor = RGB(153, 0, 0)
+    ser.MarkerBackgroundColor = RGB(255, 0, 0)
+    
+    '--------------------------------------------------
+    ' 6. Titles, legend, and axis formatting
+    '--------------------------------------------------
+    cht.HasTitle = True
+    cht.ChartTitle.Text = "Milestone Comparison: Original vs. Current Month Finish"
+    
+    cht.HasLegend = True
+    cht.Legend.Position = xlLegendPositionBottom
+    
+    With cht.Axes(xlCategory)
+        .HasTitle = True
+        .AxisTitle.Text = "Task ID"
+    End With
+    
+    With cht.Axes(xlValue)
+        .HasTitle = True
+        .AxisTitle.Text = "Finish Date"
+        .TickLabels.NumberFormat = "mm/dd/yyyy"
+        .HasMajorGridlines = True
+    End With
+    
+    MsgBox "Milestone Comparison chart created on sheet 'Milestone Comparison' " & _
+           "with " & (lastRow - 1) & " task(s).", vbInformation, "Done"
+
+End Sub
