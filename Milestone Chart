@@ -67,6 +67,7 @@ Sub BuildMilestoneComparisonChart()
     wsChart.Range("A1").Value = "Task ID"
     wsChart.Range("B1").Value = "Original Finish"
     wsChart.Range("C1").Value = "Current Month Finish"
+    wsChart.Range("D1").Value = "Position"
     
     '--------------------------------------------------
     ' 4. Look up each Task ID and pull the two dates
@@ -92,6 +93,7 @@ Sub BuildMilestoneComparisonChart()
             wsChart.Cells(outRow, 1).Value = taskIDs(i)
             If IsDate(origDate) Then wsChart.Cells(outRow, 2).Value = CDate(origDate)
             If IsDate(currDate) Then wsChart.Cells(outRow, 3).Value = CDate(currDate)
+            wsChart.Cells(outRow, 4).Value = outRow - 1   ' vertical position
             outRow = outRow + 1
         End If
     Next i
@@ -110,63 +112,125 @@ Sub BuildMilestoneComparisonChart()
     End If
     
     Dim lastRow As Long
+    Dim numTasks As Long
     lastRow = outRow - 1
+    numTasks = lastRow - 1
     
     wsChart.Range("B2:C" & lastRow).NumberFormat = "mm/dd/yyyy"
-    wsChart.Columns("A:C").AutoFit
+    wsChart.Columns("A:D").AutoFit
     
     '--------------------------------------------------
-    ' 5. Build the chart (line chart, lines hidden,
-    '    diamond markers only)
+    ' 5. Determine date range for axis scaling
+    '--------------------------------------------------
+    Dim minDate As Double, maxDate As Double, padDays As Double
+    minDate = Application.WorksheetFunction.Min(wsChart.Range("B2:C" & lastRow))
+    maxDate = Application.WorksheetFunction.Max(wsChart.Range("B2:C" & lastRow))
+    
+    padDays = (maxDate - minDate) * 0.08
+    If padDays < 7 Then padDays = 7
+    
+    '--------------------------------------------------
+    ' 6. Build the chart (XY scatter: dates on X axis,
+    '    tasks stacked on Y axis, diamond markers)
     '--------------------------------------------------
     Dim chtObj As ChartObject
     Dim cht As Chart
     Dim ser As Series
+    Dim j As Long
     
-    Set chtObj = wsChart.ChartObjects.Add(Left:=250, Top:=20, Width:=600, Height:=400)
+    Set chtObj = wsChart.ChartObjects.Add(Left:=320, Top:=20, Width:=650, Height:=400)
     Set cht = chtObj.Chart
     
-    cht.ChartType = xlLineMarkers
-    cht.SetSourceData Source:=wsChart.Range("A1:C" & lastRow)
+    cht.ChartType = xlXYScatter
+    
+    ' Remove any auto-detected series
+    Do While cht.SeriesCollection.Count > 0
+        cht.SeriesCollection(1).Delete
+    Loop
     
     ' --- Series 1: Original Finish (blue diamonds) ---
-    Set ser = cht.SeriesCollection(1)
-    ser.Format.Line.Visible = msoFalse          ' hide connecting line
+    Set ser = cht.SeriesCollection.NewSeries
+    ser.Name = "Original Finish"
+    ser.XValues = wsChart.Range("B2:B" & lastRow)
+    ser.Values = wsChart.Range("D2:D" & lastRow)
+    ser.Format.Line.Visible = msoFalse
     ser.MarkerStyle = xlMarkerStyleDiamond
     ser.MarkerSize = 12
     ser.MarkerForegroundColor = RGB(0, 51, 153)
     ser.MarkerBackgroundColor = RGB(0, 112, 192)
     
     ' --- Series 2: Current Month Finish (red diamonds) ---
-    Set ser = cht.SeriesCollection(2)
+    Set ser = cht.SeriesCollection.NewSeries
+    ser.Name = "Current Month Finish"
+    ser.XValues = wsChart.Range("C2:C" & lastRow)
+    ser.Values = wsChart.Range("D2:D" & lastRow)
     ser.Format.Line.Visible = msoFalse
     ser.MarkerStyle = xlMarkerStyleDiamond
     ser.MarkerSize = 12
     ser.MarkerForegroundColor = RGB(153, 0, 0)
     ser.MarkerBackgroundColor = RGB(255, 0, 0)
     
+    ' --- Series 3: hidden series to show Task ID labels
+    '     along the left edge of the plot area ---
+    Dim labelX() As Double
+    ReDim labelX(1 To numTasks)
+    For j = 1 To numTasks
+        labelX(j) = minDate - padDays
+    Next j
+    
+    Set ser = cht.SeriesCollection.NewSeries
+    ser.Name = "TaskLabels"
+    ser.XValues = labelX
+    ser.Values = wsChart.Range("D2:D" & lastRow)
+    ser.Format.Line.Visible = msoFalse
+    ser.MarkerStyle = xlMarkerStyleNone
+    ser.HasDataLabels = True
+    For j = 1 To numTasks
+        With ser.Points(j).DataLabel
+            .Text = wsChart.Cells(j + 1, 1).Value
+            .Position = xlLabelPositionRight
+            .Font.Size = 10
+            .Font.Bold = True
+        End With
+    Next j
+    
     '--------------------------------------------------
-    ' 6. Titles, legend, and axis formatting
+    ' 7. Titles, legend, and axis formatting
     '--------------------------------------------------
     cht.HasTitle = True
     cht.ChartTitle.Text = "Milestone Comparison: Original vs. Current Month Finish"
     
     cht.HasLegend = True
     cht.Legend.Position = xlLegendPositionBottom
+    ' Remove the label series from the legend (it is the 3rd entry)
+    cht.Legend.LegendEntries(3).Delete
     
+    ' --- X axis: dates ---
     With cht.Axes(xlCategory)
         .HasTitle = True
-        .AxisTitle.Text = "Task ID"
-    End With
-    
-    With cht.Axes(xlValue)
-        .HasTitle = True
         .AxisTitle.Text = "Finish Date"
+        .MinimumScale = minDate - (padDays * 2)
+        .MaximumScale = maxDate + padDays
         .TickLabels.NumberFormat = "mm/dd/yyyy"
+        .TickLabels.Orientation = 45
         .HasMajorGridlines = True
     End With
     
+    ' --- Y axis: task positions (labels hidden; Task IDs
+    '     shown via the hidden label series instead) ---
+    With cht.Axes(xlValue)
+        .MinimumScale = 0
+        .MaximumScale = numTasks + 1
+        .MajorUnit = 1
+        .ReversePlotOrder = True          ' first task at the top
+        .TickLabelPosition = xlTickLabelPositionNone
+        .MajorTickMark = xlTickMarkNone
+        .HasMajorGridlines = True
+        .HasTitle = False
+        .Format.Line.Visible = msoFalse
+    End With
+    
     MsgBox "Milestone Comparison chart created on sheet 'Milestone Comparison' " & _
-           "with " & (lastRow - 1) & " task(s).", vbInformation, "Done"
+           "with " & numTasks & " task(s).", vbInformation, "Done"
 
 End Sub
