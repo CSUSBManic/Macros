@@ -1,0 +1,304 @@
+Option Explicit
+
+Sub CEI_WindowAnalysis()
+
+    Const SRC_SHEET As String = "Consolidated SPD Data"
+    Const TABLE_SHEET As String = "CEI Task Table"
+    Const CHART_SHEET As String = "CEI Slip Chart"
+    
+    Const HDR_TASK_ID As String = "Task ID"
+    Const HDR_TASK_NAME As String = "Task Name"
+
+    Dim srcWs As Worksheet
+    On Error Resume Next
+    Set srcWs = ThisWorkbook.Worksheets(SRC_SHEET)
+    On Error GoTo 0
+    If srcWs Is Nothing Then Set srcWs = ActiveSheet
+    
+    ' =====================================================
+    ' 1. Prompt the user for the CEI window
+    ' =====================================================
+    Dim winStart As Date, winFinish As Date, tmpDate As Date
+    
+    If Not PromptForDate("Enter the CEI Window START date (e.g. 01/01/2026):", winStart) Then Exit Sub
+    If Not PromptForDate("Enter the CEI Window FINISH date (e.g. 06/30/2026):", winFinish) Then Exit Sub
+    
+    If winFinish < winStart Then      ' swap if entered backwards
+        tmpDate = winStart
+        winStart = winFinish
+        winFinish = tmpDate
+    End If
+    
+    ' =====================================================
+    ' 2. Locate the mm-yyyy Finish columns & sort chronologically
+    ' =====================================================
+    Dim lastCol As Long, c As Long
+    lastCol = srcWs.Cells(1, srcWs.Columns.Count).End(xlToLeft).Column
+    
+    Dim finCols() As Long, finDates() As Date, finCount As Long
+    Dim hdr As String
+    finCount = 0
+    
+    For c = 1 To lastCol
+        hdr = Trim(CStr(srcWs.Cells(1, c).Value))
+        If hdr Like "##-#### Finish" Then
+            If IsDate("01-" & Left(hdr, 7)) Then
+                finCount = finCount + 1
+                ReDim Preserve finCols(1 To finCount)
+                ReDim Preserve finDates(1 To finCount)
+                finCols(finCount) = c
+                finDates(finCount) = DateSerial(CLng(Mid(hdr, 4, 4)), CLng(Left(hdr, 2)), 1)
+            End If
+        End If
+    Next c
+    
+    If finCount = 0 Then
+        MsgBox "No columns found with headers like 'mm-yyyy Finish' on sheet '" & srcWs.Name & "'.", vbCritical
+        Exit Sub
+    End If
+    
+    Dim i As Long, j As Long, tmpL As Long, tmpD As Date
+    For i = 1 To finCount - 1
+        For j = i + 1 To finCount
+            If finDates(j) < finDates(i) Then
+                tmpD = finDates(i): finDates(i) = finDates(j): finDates(j) = tmpD
+                tmpL = finCols(i): finCols(i) = finCols(j): finCols(j) = tmpL
+            End If
+        Next j
+    Next i
+    
+    Dim earliestFinCol As Long
+    earliestFinCol = finCols(1)   ' the Earliest Monthly Finish column
+    
+    ' =====================================================
+    ' 3. Locate ID / Name columns
+    ' =====================================================
+    Dim idCol As Long, nameCol As Long
+    idCol = FindHeaderCEI(srcWs, HDR_TASK_ID)
+    nameCol = FindHeaderCEI(srcWs, HDR_TASK_NAME)
+    If nameCol = 0 Then nameCol = FindHeaderCEI(srcWs, "Name")
+    
+    If idCol = 0 Then
+        MsgBox "Could not find a '" & HDR_TASK_ID & "' column on sheet '" & srcWs.Name & "'.", vbCritical
+        Exit Sub
+    End If
+    
+    ' =====================================================
+    ' 4. Rebuild the output sheets
+    ' =====================================================
+    Application.DisplayAlerts = False
+    On Error Resume Next
+    ThisWorkbook.Worksheets(TABLE_SHEET).Delete
+    ThisWorkbook.Worksheets(CHART_SHEET).Delete
+    On Error GoTo 0
+    Application.DisplayAlerts = True
+    
+    Dim tblWs As Worksheet, chWs As Worksheet
+    Set tblWs = ThisWorkbook.Worksheets.Add(After:=srcWs)
+    tblWs.Name = TABLE_SHEET
+    Set chWs = ThisWorkbook.Worksheets.Add(After:=tblWs)
+    chWs.Name = CHART_SHEET
+    
+    ' --- Detail table headers ---
+    tblWs.Cells(1, 1).Value = "Task ID"
+    tblWs.Cells(1, 2).Value = "Task Name"
+    tblWs.Cells(1, 3).Value = "Earliest Finish"
+    tblWs.Cells(1, 4).Value = "Finish Month"
+    tblWs.Cells(1, 5).Value = "Slip Count"
+    tblWs.Cells(1, 6).Value = "Category"
+    For i = 1 To finCount
+        tblWs.Cells(1, 6 + i).Value = srcWs.Cells(1, finCols(i)).Value
+    Next i
+    
+    ' =====================================================
+    ' 5. Filter tasks by window & count month slips
+    ' =====================================================
+    Dim lastRow As Long, r As Long, outRow As Long
+    Dim earliestFin As Variant, v As Variant
+    Dim slips As Long, prevSet As Boolean, prevMonths As Long, curMonths As Long
+    Dim cat As String
+    
+    lastRow = srcWs.Cells(srcWs.Rows.Count, idCol).End(xlUp).Row
+    outRow = 2
+    
+    For r = 2 To lastRow
+        earliestFin = srcWs.Cells(r, earliestFinCol).Value
+        
+        If IsDate(earliestFin) Then
+            If CDate(earliestFin) >= winStart And CDate(earliestFin) <= winFinish Then
+                
+                ' --- Count slips: each move to a LATER month vs. the prior monthly value ---
+                slips = 0
+                prevSet = False
+                prevMonths = 0
+                
+                For i = 1 To finCount
+                    v = srcWs.Cells(r, finCols(i)).Value
+                    If IsDate(v) Then
+                        curMonths = Year(CDate(v)) * 12 + Month(CDate(v))
+                        If prevSet Then
+                            If curMonths > prevMonths Then slips = slips + 1
+                        End If
+                        prevMonths = curMonths
+                        prevSet = True
+                    End If
+                Next i
+                
+                Select Case slips
+                    Case 0: cat = "Hits"
+                    Case 1: cat = "Miss - 1 Slip"
+                    Case 2: cat = "Miss - 2 Slips"
+                    Case Else: cat = "Miss - 3+ Slips"
+                End Select
+                
+                ' --- Write the row ---
+                tblWs.Cells(outRow, 1).Value = srcWs.Cells(r, idCol).Value
+                If nameCol > 0 Then tblWs.Cells(outRow, 2).Value = srcWs.Cells(r, nameCol).Value
+                tblWs.Cells(outRow, 3).Value = CDate(earliestFin)
+                tblWs.Cells(outRow, 4).Value = DateSerial(Year(CDate(earliestFin)), Month(CDate(earliestFin)), 1)
+                tblWs.Cells(outRow, 5).Value = slips
+                tblWs.Cells(outRow, 6).Value = cat
+                For i = 1 To finCount
+                    tblWs.Cells(outRow, 6 + i).Value = srcWs.Cells(r, finCols(i)).Value
+                Next i
+                
+                outRow = outRow + 1
+            End If
+        End If
+    Next r
+    
+    If outRow = 2 Then
+        MsgBox "No tasks found with an Earliest Monthly Finish between " & _
+               Format(winStart, "mm/dd/yyyy") & " and " & Format(winFinish, "mm/dd/yyyy") & ".", vbExclamation
+        Exit Sub
+    End If
+    
+    ' --- Format & convert the detail range to an Excel Table ---
+    tblWs.Range(tblWs.Cells(2, 3), tblWs.Cells(outRow - 1, 3)).NumberFormat = "mm/dd/yyyy"
+    tblWs.Range(tblWs.Cells(2, 4), tblWs.Cells(outRow - 1, 4)).NumberFormat = "mm-yyyy"
+    tblWs.Range(tblWs.Cells(2, 7), tblWs.Cells(outRow - 1, 6 + finCount)).NumberFormat = "mm/dd/yyyy"
+    
+    Dim lo As ListObject
+    Set lo = tblWs.ListObjects.Add(xlSrcRange, _
+             tblWs.Range(tblWs.Cells(1, 1), tblWs.Cells(outRow - 1, 6 + finCount)), , xlYes)
+    lo.Name = "tblCEI"
+    lo.TableStyle = "TableStyleMedium2"
+    tblWs.Columns.AutoFit
+    
+    ' =====================================================
+    ' 6. Build the PivotTable (drill-down enabled)
+    ' =====================================================
+    Dim pc As PivotCache, pt As PivotTable
+    Set pc = ThisWorkbook.PivotCaches.Create(SourceType:=xlDatabase, SourceData:="tblCEI")
+    Set pt = pc.CreatePivotTable(TableDestination:=chWs.Range("A3"), TableName:="ptCEI")
+    
+    With pt
+        With .PivotFields("Finish Month")
+            .Orientation = xlRowField
+            .NumberFormat = "mm-yyyy"
+        End With
+        .PivotFields("Category").Orientation = xlColumnField
+        .AddDataField .PivotFields("Task ID"), "Task Count", xlCount
+        .ColumnGrand = True
+        .RowGrand = True
+    End With
+    
+    ' --- Force the stacking order: Hits at the bottom, then 1, 2, 3+ ---
+    On Error Resume Next
+    With pt.PivotFields("Category")
+        .PivotItems("Hits").Position = 1
+        .PivotItems("Miss - 1 Slip").Position = 2
+        .PivotItems("Miss - 2 Slips").Position = 3
+        .PivotItems("Miss - 3+ Slips").Position = 4
+    End With
+    On Error GoTo 0
+    
+    ' =====================================================
+    ' 7. Build the stacked chart with custom colors
+    ' =====================================================
+    Dim shp As Shape, ch As Chart
+    Set shp = chWs.Shapes.AddChart2(XlChartType:=xlColumnStacked)
+    Set ch = shp.Chart
+    ch.SetSourceData pt.TableRange1
+    
+    shp.Left = chWs.Range("H2").Left
+    shp.Top = chWs.Range("H2").Top
+    shp.Width = 700
+    shp.Height = 420
+    
+    With ch
+        .HasTitle = True
+        .ChartTitle.Text = "CEI Window: " & Format(winStart, "mm/dd/yyyy") & " - " & _
+                           Format(winFinish, "mm/dd/yyyy") & "  (Tasks by Earliest Monthly Finish)"
+        .Axes(xlCategory).HasTitle = True
+        .Axes(xlCategory).AxisTitle.Text = "Earliest Monthly Finish (mm-yyyy)"
+        .Axes(xlValue).HasTitle = True
+        .Axes(xlValue).AxisTitle.Text = "Task Count"
+        .HasLegend = True
+        .Legend.Position = xlLegendPositionBottom
+        On Error Resume Next
+        .ShowAllFieldButtons = False
+        On Error GoTo 0
+    End With
+    
+    Dim srs As Series
+    For Each srs In ch.SeriesCollection
+        Select Case srs.Name
+            Case "Hits":              srs.Format.Fill.ForeColor.RGB = RGB(68, 114, 196)   ' Blue
+            Case "Miss - 1 Slip":     srs.Format.Fill.ForeColor.RGB = RGB(255, 192, 0)    ' Yellow
+            Case "Miss - 2 Slips":    srs.Format.Fill.ForeColor.RGB = RGB(237, 125, 49)   ' Orange
+            Case "Miss - 3+ Slips":   srs.Format.Fill.ForeColor.RGB = RGB(192, 0, 0)      ' Red
+        End Select
+    Next srs
+    
+    chWs.Range("A1").Value = "CEI Slip Analysis - double-click any pivot value to drill down to its tasks"
+    chWs.Range("A1").Font.Bold = True
+    chWs.Columns("A:F").AutoFit
+    
+    MsgBox "CEI analysis complete!" & vbNewLine & vbNewLine & _
+           (outRow - 2) & " tasks fall within the window." & vbNewLine & _
+           finCount & " monthly Finish columns compared for slips." & vbNewLine & vbNewLine & _
+           "Tip: double-click any count in the PivotTable on '" & CHART_SHEET & _
+           "' to drill down to the underlying tasks.", vbInformation
+
+End Sub
+
+' --- Prompts until a valid date is entered; returns False if user cancels ---
+Private Function PromptForDate(promptText As String, ByRef result As Date) As Boolean
+    Dim s As String
+    Do
+        s = InputBox(promptText, "CEI Window")
+        If Len(s) = 0 Then
+            PromptForDate = False
+            Exit Function
+        End If
+        If IsDate(s) Then
+            result = CDate(s)
+            PromptForDate = True
+            Exit Function
+        End If
+        MsgBox "'" & s & "' is not a valid date. Please try again.", vbExclamation
+    Loop
+End Function
+
+' --- Finds a header in row 1 (exact match, then partial) ---
+Private Function FindHeaderCEI(ws As Worksheet, headerText As String) As Long
+    Dim c As Range, lastCol As Long
+    lastCol = ws.Cells(1, ws.Columns.Count).End(xlToLeft).Column
+    
+    For Each c In ws.Range(ws.Cells(1, 1), ws.Cells(1, lastCol))
+        If StrComp(Trim(CStr(c.Value)), headerText, vbTextCompare) = 0 Then
+            FindHeaderCEI = c.Column
+            Exit Function
+        End If
+    Next c
+    
+    For Each c In ws.Range(ws.Cells(1, 1), ws.Cells(1, lastCol))
+        If InStr(1, CStr(c.Value), headerText, vbTextCompare) > 0 Then
+            FindHeaderCEI = c.Column
+            Exit Function
+        End If
+    Next c
+    
+    FindHeaderCEI = 0
+End Function
