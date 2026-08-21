@@ -1,0 +1,276 @@
+Option Explicit
+
+Sub BuildFTECompare()
+
+    Dim wb As Workbook
+    Dim wsSched As Worksheet, wsFTE As Worksheet, wsOut As Worksheet
+    Dim tabName As String, startInput As String, endInput As String
+    Dim dStart As Date, dEnd As Date
+    Dim i As Long, m As Long, lastRow As Long
+    Dim monthCount As Long
+    Dim months() As Date
+    Dim cntStart() As Long, cntFinish() As Long, cntInProg() As Long
+    Dim fteSum() As Double
+    
+    Set wb = ThisWorkbook
+    
+    '=========================================================
+    ' 1. PROMPT USER FOR THE SCHEDULE DATA TAB
+    '=========================================================
+    Dim availableTabs As String, ws As Worksheet
+    availableTabs = ""
+    For Each ws In wb.Worksheets
+        If ws.Name Like "##-####" Then
+            availableTabs = availableTabs & ws.Name & vbCrLf
+        End If
+    Next ws
+    
+    If availableTabs = "" Then
+        MsgBox "No schedule tabs found in mm-yyyy format (e.g. 01-2026).", vbExclamation
+        Exit Sub
+    End If
+    
+    tabName = InputBox("Enter the Schedule Data tab to use (mm-yyyy format)." & vbCrLf & vbCrLf & _
+                       "Available tabs:" & vbCrLf & availableTabs, "Select Schedule Tab")
+    If tabName = "" Then Exit Sub 'User cancelled
+    
+    On Error Resume Next
+    Set wsSched = wb.Worksheets(tabName)
+    On Error GoTo 0
+    If wsSched Is Nothing Then
+        MsgBox "Tab '" & tabName & "' was not found. Please re-run and enter an exact tab name.", vbExclamation
+        Exit Sub
+    End If
+    
+    '=========================================================
+    ' 2. PROMPT USER FOR THE DATE RANGE
+    '=========================================================
+    startInput = InputBox("Enter the START of the date range (e.g. 1/1/2026):", "Date Range - Start")
+    If startInput = "" Then Exit Sub
+    If Not IsDate(startInput) Then
+        MsgBox "'" & startInput & "' is not a valid date.", vbExclamation
+        Exit Sub
+    End If
+    
+    endInput = InputBox("Enter the END of the date range (e.g. 6/30/2026):", "Date Range - End")
+    If endInput = "" Then Exit Sub
+    If Not IsDate(endInput) Then
+        MsgBox "'" & endInput & "' is not a valid date.", vbExclamation
+        Exit Sub
+    End If
+    
+    dStart = CDate(startInput)
+    dEnd = CDate(endInput)
+    If dEnd < dStart Then
+        MsgBox "The end date must be on or after the start date.", vbExclamation
+        Exit Sub
+    End If
+    
+    'Snap the working window to full months
+    dStart = DateSerial(Year(dStart), Month(dStart), 1)
+    dEnd = DateSerial(Year(dEnd), Month(dEnd) + 1, 0) 'last day of end month
+    
+    'Build the list of months in the window
+    monthCount = DateDiff("m", dStart, dEnd) + 1
+    ReDim months(1 To monthCount)
+    ReDim cntStart(1 To monthCount)
+    ReDim cntFinish(1 To monthCount)
+    ReDim cntInProg(1 To monthCount)
+    ReDim fteSum(1 To monthCount)
+    
+    For m = 1 To monthCount
+        months(m) = DateAdd("m", m - 1, dStart)
+    Next m
+    
+    '=========================================================
+    ' 3. TALLY TASKS FROM THE SCHEDULE TAB
+    '=========================================================
+    Dim colStart As Long, colFinish As Long
+    colStart = FindHeaderColumn(wsSched, "Current Start Date")
+    colFinish = FindHeaderColumn(wsSched, "Current Finish Date")
+    
+    If colStart = 0 Or colFinish = 0 Then
+        MsgBox "Could not find 'Current Start Date' and/or 'Current Finish Date' headers in row 1 of tab '" & tabName & "'.", vbExclamation
+        Exit Sub
+    End If
+    
+    lastRow = wsSched.Cells(wsSched.Rows.Count, colStart).End(xlUp).Row
+    If lastRow < wsSched.Cells(wsSched.Rows.Count, colFinish).End(xlUp).Row Then
+        lastRow = wsSched.Cells(wsSched.Rows.Count, colFinish).End(xlUp).Row
+    End If
+    
+    Dim tStart As Variant, tFinish As Variant
+    Dim taskStart As Date, taskFinish As Date
+    Dim monthFirst As Date, monthLast As Date
+    
+    For i = 2 To lastRow
+        tStart = wsSched.Cells(i, colStart).Value
+        tFinish = wsSched.Cells(i, colFinish).Value
+        
+        If IsDate(tStart) And IsDate(tFinish) Then
+            taskStart = CDate(tStart)
+            taskFinish = CDate(tFinish)
+            
+            For m = 1 To monthCount
+                monthFirst = months(m)
+                monthLast = DateSerial(Year(monthFirst), Month(monthFirst) + 1, 0)
+                
+                'Task starts during this month
+                If taskStart >= monthFirst And taskStart <= monthLast Then
+                    cntStart(m) = cntStart(m) + 1
+                End If
+                
+                'Task finishes during this month
+                If taskFinish >= monthFirst And taskFinish <= monthLast Then
+                    cntFinish(m) = cntFinish(m) + 1
+                End If
+                
+                'Task in progress: started before the month began AND
+                'finishes after the month ends (spans the entire month)
+                If taskStart < monthFirst And taskFinish > monthLast Then
+                    cntInProg(m) = cntInProg(m) + 1
+                End If
+            Next m
+        End If
+    Next i
+    
+    '=========================================================
+    ' 4. PULL QUALIFYING FTE VALUES FROM "Forecast FTE's"
+    '=========================================================
+    On Error Resume Next
+    Set wsFTE = wb.Worksheets("Forecast FTE's")
+    On Error GoTo 0
+    If wsFTE Is Nothing Then
+        MsgBox "Tab 'Forecast FTE's' was not found in this workbook.", vbExclamation
+        Exit Sub
+    End If
+    
+    Dim colResults As Long, colCostSet As Long, colDate As Long, colValue As Long
+    colResults = FindHeaderColumn(wsFTE, "Results")
+    colCostSet = FindHeaderColumn(wsFTE, "Cost Set")
+    colDate = FindHeaderColumn(wsFTE, "Date")
+    colValue = FindHeaderColumn(wsFTE, "Value")
+    
+    If colResults = 0 Or colCostSet = 0 Or colDate = 0 Or colValue = 0 Then
+        MsgBox "Could not find one or more required headers ('Results', 'Cost Set', 'Date', 'Value') in row 1 of 'Forecast FTE's'.", vbExclamation
+        Exit Sub
+    End If
+    
+    lastRow = wsFTE.Cells(wsFTE.Rows.Count, colDate).End(xlUp).Row
+    
+    Dim fDate As Variant, fVal As Variant
+    Dim fDateD As Date, mIdx As Long
+    
+    For i = 2 To lastRow
+        If UCase(Trim(CStr(wsFTE.Cells(i, colResults).Value))) = "FTE" And _
+           UCase(Trim(CStr(wsFTE.Cells(i, colCostSet).Value))) = "EAC" Then
+            
+            fDate = wsFTE.Cells(i, colDate).Value
+            fVal = wsFTE.Cells(i, colValue).Value
+            
+            If IsDate(fDate) And IsNumeric(fVal) Then
+                fDateD = CDate(fDate)
+                If fDateD >= dStart And fDateD <= dEnd Then
+                    mIdx = DateDiff("m", dStart, DateSerial(Year(fDateD), Month(fDateD), 1)) + 1
+                    If mIdx >= 1 And mIdx <= monthCount Then
+                        fteSum(mIdx) = fteSum(mIdx) + CDbl(fVal)
+                    End If
+                End If
+            End If
+        End If
+    Next i
+    
+    '=========================================================
+    ' 5. WRITE THE AGGREGATED DATA TO A STAGING SHEET
+    '=========================================================
+    Application.DisplayAlerts = False
+    On Error Resume Next
+    wb.Worksheets("Chart Data").Delete
+    On Error GoTo 0
+    Application.DisplayAlerts = True
+    
+    Set wsOut = wb.Worksheets.Add(After:=wb.Worksheets(wb.Worksheets.Count))
+    wsOut.Name = "Chart Data"
+    
+    With wsOut
+        .Cells(1, 1).Value = "Month"
+        .Cells(1, 2).Value = "Tasks Starting"
+        .Cells(1, 3).Value = "Tasks Finishing"
+        .Cells(1, 4).Value = "Tasks In-Progress"
+        .Cells(1, 5).Value = "Forecast FTEs"
+        
+        For m = 1 To monthCount
+            .Cells(m + 1, 1).Value = months(m)
+            .Cells(m + 1, 1).NumberFormat = "mmm yyyy"
+            .Cells(m + 1, 2).Value = cntStart(m)
+            .Cells(m + 1, 3).Value = cntFinish(m)
+            .Cells(m + 1, 4).Value = cntInProg(m)
+            .Cells(m + 1, 5).Value = fteSum(m)
+        Next m
+        
+        .Range("A1:E1").Font.Bold = True
+        .Columns("A:E").AutoFit
+    End With
+    
+    '=========================================================
+    ' 6. BUILD THE COMBO CHART
+    '=========================================================
+    Dim chtObj As ChartObject
+    Dim cht As Chart
+    
+    Set chtObj = wsOut.ChartObjects.Add(Left:=wsOut.Range("G2").Left, _
+                                        Top:=wsOut.Range("G2").Top, _
+                                        Width:=700, Height:=400)
+    Set cht = chtObj.Chart
+    
+    With cht
+        .SetSourceData Source:=wsOut.Range(wsOut.Cells(1, 1), wsOut.Cells(monthCount + 1, 5))
+        .ChartType = xlColumnStacked
+        
+        'Convert the FTE series to an Area chart on the secondary axis
+        '(change xlArea to xlLine below if you prefer a line)
+        With .SeriesCollection("Forecast FTEs")
+            .ChartType = xlArea
+            .AxisGroup = xlSecondary
+            .Format.Fill.Transparency = 0.5   'semi-transparent so bars stay visible
+        End With
+        
+        'Force the X axis to treat months as categories (no calendar gaps)
+        .Axes(xlCategory).CategoryType = xlCategoryScale
+        
+        'Titles
+        .HasTitle = True
+        .ChartTitle.Text = "Schedule Tasks vs. Forecast FTEs (" & _
+                           Format(dStart, "mmm yyyy") & " - " & Format(dEnd, "mmm yyyy") & _
+                           ") | Source: " & tabName
+        
+        .Axes(xlValue, xlPrimary).HasTitle = True
+        .Axes(xlValue, xlPrimary).AxisTitle.Text = "Task Count"
+        
+        .Axes(xlValue, xlSecondary).HasTitle = True
+        .Axes(xlValue, xlSecondary).AxisTitle.Text = "Forecast FTEs"
+        
+        .Axes(xlCategory).HasTitle = True
+        .Axes(xlCategory).AxisTitle.Text = "Month"
+        
+        .HasLegend = True
+        .Legend.Position = xlLegendPositionBottom
+    End With
+    
+    wsOut.Activate
+    MsgBox "Chart created successfully on the 'Chart Data' tab.", vbInformation
+
+End Sub
+
+'Helper: finds a column by header text in row 1 (case-insensitive, trims spaces)
+Private Function FindHeaderColumn(ws As Worksheet, headerText As String) As Long
+    Dim c As Long, lastCol As Long
+    lastCol = ws.Cells(1, ws.Columns.Count).End(xlToLeft).Column
+    For c = 1 To lastCol
+        If UCase(Trim(CStr(ws.Cells(1, c).Value))) = UCase(Trim(headerText)) Then
+            FindHeaderColumn = c
+            Exit Function
+        End If
+    Next c
+    FindHeaderColumn = 0
+End Function
