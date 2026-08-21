@@ -1,0 +1,426 @@
+Option Explicit
+
+Sub BuildMonthlyCEIAnalysis()
+
+    Const SOURCE_SHEET As String = "Consolidated SPD Data"
+    Const DATA_SHEET As String = "CEI Data"
+    Const CHART_SHEET As String = "CEI Chart"
+    
+    Const HDR_TASK_ID As String = "Task ID"
+    Const HDR_TASK_NAME As String = "Task Name"
+    Const HDR_CAM As String = "CAM"
+    Const HDR_IPT As String = "IPT"
+    
+    ' Slip category labels
+    Const CAT_HIT As String = "Hits"
+    Const CAT_1 As String = "Miss - 1 Slip"
+    Const CAT_2 As String = "Miss - 2 Slips"
+    Const CAT_3 As String = "Miss - 3+ Slips"
+
+    Dim srcWs As Worksheet
+    On Error Resume Next
+    Set srcWs = ThisWorkbook.Worksheets(SOURCE_SHEET)
+    On Error GoTo 0
+    If srcWs Is Nothing Then
+        MsgBox "Sheet '" & SOURCE_SHEET & "' was not found. Run the consolidation macro first.", vbCritical
+        Exit Sub
+    End If
+    
+    ' =====================================================
+    ' 1. Prompt user for the CEI Window
+    ' =====================================================
+    Dim winStart As Date, winEnd As Date
+    If Not PromptForDate("Enter the CEI Window START date (e.g., 01/01/2026):", winStart) Then Exit Sub
+    If Not PromptForDate("Enter the CEI Window FINISH date (e.g., 06/30/2026):", winEnd) Then Exit Sub
+    
+    If winEnd < winStart Then
+        MsgBox "The CEI Window Finish date is earlier than the Start date.", vbCritical
+        Exit Sub
+    End If
+    
+    Dim monthsCount As Long
+    monthsCount = (Year(winEnd) - Year(winStart)) * 12 + (Month(winEnd) - Month(winStart)) + 1
+    
+    ' =====================================================
+    ' 2. Locate columns on the source sheet
+    ' =====================================================
+    Dim idCol As Long, nameCol As Long, camCol As Long, iptCol As Long
+    idCol = FindHeader(srcWs, HDR_TASK_ID)
+    nameCol = FindHeader(srcWs, HDR_TASK_NAME)
+    camCol = FindHeader(srcWs, HDR_CAM)
+    iptCol = FindHeader(srcWs, HDR_IPT)
+    
+    If idCol = 0 Then
+        MsgBox "Could not find a '" & HDR_TASK_ID & "' column on '" & SOURCE_SHEET & "'.", vbCritical
+        Exit Sub
+    End If
+    
+    ' Find all "mm-yyyy Finish" columns
+    Dim finCols() As Long, finDates() As Date, finCount As Long
+    Dim lastCol As Long, c As Long
+    Dim h As String
+    
+    finCount = 0
+    lastCol = srcWs.Cells(1, srcWs.Columns.Count).End(xlToLeft).Column
+    
+    For c = 1 To lastCol
+        h = Trim(CStr(srcWs.Cells(1, c).Value))
+        If h Like "##-#### Finish" Then
+            finCount = finCount + 1
+            ReDim Preserve finCols(1 To finCount)
+            ReDim Preserve finDates(1 To finCount)
+            finCols(finCount) = c
+            finDates(finCount) = DateSerial(CLng(Mid(h, 4, 4)), CLng(Left(h, 2)), 1)
+        End If
+    Next c
+    
+    If finCount = 0 Then
+        MsgBox "No 'mm-yyyy Finish' columns found on '" & SOURCE_SHEET & "'.", vbCritical
+        Exit Sub
+    End If
+    
+    ' Sort the finish columns chronologically
+    Dim i As Long, j As Long, tmpL As Long, tmpD As Date
+    For i = 1 To finCount - 1
+        For j = i + 1 To finCount
+            If finDates(j) < finDates(i) Then
+                tmpD = finDates(i): finDates(i) = finDates(j): finDates(j) = tmpD
+                tmpL = finCols(i): finCols(i) = finCols(j): finCols(j) = tmpL
+            End If
+        Next j
+    Next i
+    
+    Dim earliestFinCol As Long
+    earliestFinCol = finCols(1)   ' the Earliest Monthly Finish Column
+    
+    ' =====================================================
+    ' 3. Rebuild output sheets
+    ' =====================================================
+    Application.ScreenUpdating = False
+    Application.DisplayAlerts = False
+    On Error Resume Next
+    ThisWorkbook.SlicerCaches("scCEI_CAM").Delete
+    ThisWorkbook.SlicerCaches("scCEI_IPT").Delete
+    ThisWorkbook.Worksheets(DATA_SHEET).Delete
+    ThisWorkbook.Worksheets(CHART_SHEET).Delete
+    On Error GoTo 0
+    Application.DisplayAlerts = True
+    
+    Dim dataWs As Worksheet, chartWs As Worksheet
+    Set dataWs = ThisWorkbook.Worksheets.Add(After:=srcWs)
+    dataWs.Name = DATA_SHEET
+    Set chartWs = ThisWorkbook.Worksheets.Add(After:=dataWs)
+    chartWs.Name = CHART_SHEET
+    
+    ' =====================================================
+    ' 4. Build the unified detail table
+    '    "Bar" rows  -> feed the stacked bar chart (one per task in window)
+    '    "CEI" rows  -> feed the month-to-month CEI calc (one per task per
+    '                   month it was forecasted for, as of the prior snapshot)
+    ' =====================================================
+    dataWs.Range("A1:J1").Value = Array(HDR_TASK_ID, HDR_TASK_NAME, HDR_CAM, HDR_IPT, _
+                                        "Row Type", "Month", "Earliest Finish", _
+                                        "Slip Count", "Slip Category", "Hit")
+    
+    Dim lastRow As Long, r As Long, outRow As Long
+    Dim ef As Variant, v As Variant, sv As Variant
+    Dim slips As Long, prevSerial As Long, curSerial As Long
+    Dim k As Long
+    Dim barCount As Long
+    
+    lastRow = srcWs.Cells(srcWs.Rows.Count, idCol).End(xlUp).Row
+    outRow = 2
+    barCount = 0
+    
+    ' ---- 4a. "Bar" rows: tasks whose Earliest Monthly Finish is in the window ----
+    For r = 2 To lastRow
+        ef = srcWs.Cells(r, earliestFinCol).Value
+        
+        If IsDate(ef) Then
+            If CDate(ef) >= winStart And CDate(ef) <= winEnd Then
+                
+                ' Count monthly slips across consecutive snapshots
+                slips = 0
+                prevSerial = -1
+                For k = 1 To finCount
+                    v = srcWs.Cells(r, finCols(k)).Value
+                    If IsDate(v) Then
+                        curSerial = Year(v) * 12 + Month(v)
+                        If prevSerial >= 0 And curSerial > prevSerial Then slips = slips + 1
+                        prevSerial = curSerial
+                    End If
+                Next k
+                
+                dataWs.Cells(outRow, 1).Value = srcWs.Cells(r, idCol).Value
+                If nameCol > 0 Then dataWs.Cells(outRow, 2).Value = srcWs.Cells(r, nameCol).Value
+                If camCol > 0 Then dataWs.Cells(outRow, 3).Value = srcWs.Cells(r, camCol).Value
+                If iptCol > 0 Then dataWs.Cells(outRow, 4).Value = srcWs.Cells(r, iptCol).Value
+                dataWs.Cells(outRow, 5).Value = "Bar"
+                dataWs.Cells(outRow, 6).Value = "'" & Format(CDate(ef), "mm-yyyy")
+                dataWs.Cells(outRow, 7).Value = CDate(ef)
+                dataWs.Cells(outRow, 7).NumberFormat = "mm/dd/yyyy"
+                dataWs.Cells(outRow, 8).Value = slips
+                
+                Select Case slips
+                    Case 0: dataWs.Cells(outRow, 9).Value = CAT_HIT
+                    Case 1: dataWs.Cells(outRow, 9).Value = CAT_1
+                    Case 2: dataWs.Cells(outRow, 9).Value = CAT_2
+                    Case Else: dataWs.Cells(outRow, 9).Value = CAT_3
+                End Select
+                
+                outRow = outRow + 1
+                barCount = barCount + 1
+            End If
+        End If
+    Next r
+    
+    If barCount = 0 Then
+        Application.ScreenUpdating = True
+        MsgBox "No tasks found with an Earliest Monthly Finish between " & _
+               Format(winStart, "mm/dd/yyyy") & " and " & Format(winEnd, "mm/dd/yyyy") & ".", vbExclamation
+        Exit Sub
+    End If
+    
+    ' ---- 4b. "CEI" rows: month-to-month forecast vs. execution ----
+    ' For each month M in the window:
+    '   Baseline snapshot = latest finish column BEFORE month M (normally M-1)
+    '   Status snapshot   = earliest finish column ON/AFTER month M (normally M)
+    '   Denominator: tasks whose baseline finish falls in month M
+    '   Hit = 1 if that task's status finish is still in month M (or earlier)
+    Dim m As Long, mDate As Date, mSerial As Long, mLabel As String
+    Dim baseIdx As Long, statIdx As Long
+    Dim baseSerial As Long
+    
+    For m = 0 To monthsCount - 1
+        mDate = DateAdd("m", m, DateSerial(Year(winStart), Month(winStart), 1))
+        mSerial = Year(mDate) * 12 + Month(mDate)
+        mLabel = Format(mDate, "mm-yyyy")
+        
+        ' Baseline: latest snapshot strictly before month M
+        baseIdx = 0
+        For k = 1 To finCount
+            If (Year(finDates(k)) * 12 + Month(finDates(k))) < mSerial Then baseIdx = k
+        Next k
+        
+        ' Status: earliest snapshot on/after month M
+        statIdx = 0
+        For k = finCount To 1 Step -1
+            If (Year(finDates(k)) * 12 + Month(finDates(k))) >= mSerial Then statIdx = k
+        Next k
+        
+        If baseIdx > 0 And statIdx > 0 Then
+            For r = 2 To lastRow
+                v = srcWs.Cells(r, finCols(baseIdx)).Value
+                If IsDate(v) Then
+                    baseSerial = Year(v) * 12 + Month(v)
+                    If baseSerial = mSerial Then
+                        ' Task was forecasted to finish in month M as of the prior snapshot
+                        sv = srcWs.Cells(r, finCols(statIdx)).Value
+                        If IsDate(sv) Then
+                            dataWs.Cells(outRow, 1).Value = srcWs.Cells(r, idCol).Value
+                            If nameCol > 0 Then dataWs.Cells(outRow, 2).Value = srcWs.Cells(r, nameCol).Value
+                            If camCol > 0 Then dataWs.Cells(outRow, 3).Value = srcWs.Cells(r, camCol).Value
+                            If iptCol > 0 Then dataWs.Cells(outRow, 4).Value = srcWs.Cells(r, iptCol).Value
+                            dataWs.Cells(outRow, 5).Value = "CEI"
+                            dataWs.Cells(outRow, 6).Value = "'" & mLabel
+                            
+                            If (Year(sv) * 12 + Month(sv)) <= mSerial Then
+                                dataWs.Cells(outRow, 10).Value = 1   ' Hit: still finishing in (or before) month M
+                            Else
+                                dataWs.Cells(outRow, 10).Value = 0   ' Slipped out of month M
+                            End If
+                            
+                            outRow = outRow + 1
+                        End If
+                    End If
+                End If
+            Next r
+        End If
+    Next m
+    
+    Dim tbl As ListObject
+    Set tbl = dataWs.ListObjects.Add(xlSrcRange, dataWs.Range("A1").CurrentRegion, , xlYes)
+    tbl.Name = "tblCEI"
+    dataWs.Columns("A:J").AutoFit
+    
+    ' =====================================================
+    ' 5. PivotTables (shared cache so slicers drive both)
+    ' =====================================================
+    Dim pc As PivotCache, pt As PivotTable, pt2 As PivotTable
+    Set pc = ThisWorkbook.PivotCaches.Create(SourceType:=xlDatabase, SourceData:=tbl.Range)
+    
+    ' Pivot 1: stacked bar source (Bar rows only)
+    Set pt = pc.CreatePivotTable(TableDestination:=dataWs.Range("L1"), TableName:="ptCEI")
+    With pt
+        .PivotFields("Row Type").Orientation = xlPageField
+        .PivotFields("Row Type").CurrentPage = "Bar"
+        .PivotFields("Month").Orientation = xlRowField
+        .PivotFields("Slip Category").Orientation = xlColumnField
+        .AddDataField .PivotFields(HDR_TASK_ID), "Task Count", xlCount
+        .ColumnGrand = True
+        .RowGrand = True
+    End With
+    
+    ' Pivot 2: month-to-month CEI source (CEI rows only)
+    Set pt2 = pc.CreatePivotTable(TableDestination:=dataWs.Range("U1"), TableName:="ptCEIMonth")
+    With pt2
+        .PivotFields("Row Type").Orientation = xlPageField
+        .PivotFields("Row Type").CurrentPage = "CEI"
+        .PivotFields("Month").Orientation = xlRowField
+        .AddDataField .PivotFields(HDR_TASK_ID), "Forecast Count", xlCount
+        .AddDataField .PivotFields("Hit"), "Hit Count", xlSum
+        .ColumnGrand = False
+        .RowGrand = True
+    End With
+    
+    Dim pvtRef As String, pvtRef2 As String
+    pvtRef = "'" & DATA_SHEET & "'!" & pt.TableRange2.Cells(1, 1).Address
+    pvtRef2 = "'" & DATA_SHEET & "'!" & pt2.TableRange2.Cells(1, 1).Address
+    
+    ' =====================================================
+    ' 6. Staging table on the chart sheet (feeds the chart)
+    ' =====================================================
+    Dim sRow As Long
+    
+    chartWs.Range("A1:G1").Value = Array("Month", CAT_HIT, CAT_1, CAT_2, CAT_3, "Total Tasks", "CEI")
+    
+    For m = 0 To monthsCount - 1
+        sRow = 2 + m
+        mLabel = Format(DateAdd("m", m, DateSerial(Year(winStart), Month(winStart), 1)), "mm-yyyy")
+        
+        chartWs.Cells(sRow, 1).Value = "'" & mLabel
+        chartWs.Cells(sRow, 2).Formula = "=IFERROR(GETPIVOTDATA(""Task Count""," & pvtRef & _
+            ",""Month"",""" & mLabel & """,""Slip Category"",""" & CAT_HIT & """),0)"
+        chartWs.Cells(sRow, 3).Formula = "=IFERROR(GETPIVOTDATA(""Task Count""," & pvtRef & _
+            ",""Month"",""" & mLabel & """,""Slip Category"",""" & CAT_1 & """),0)"
+        chartWs.Cells(sRow, 4).Formula = "=IFERROR(GETPIVOTDATA(""Task Count""," & pvtRef & _
+            ",""Month"",""" & mLabel & """,""Slip Category"",""" & CAT_2 & """),0)"
+        chartWs.Cells(sRow, 5).Formula = "=IFERROR(GETPIVOTDATA(""Task Count""," & pvtRef & _
+            ",""Month"",""" & mLabel & """,""Slip Category"",""" & CAT_3 & """),0)"
+        chartWs.Cells(sRow, 6).Formula = "=SUM(B" & sRow & ":E" & sRow & ")"
+        
+        ' Month-to-month CEI: Hits in month M / tasks forecasted for M as of prior snapshot
+        chartWs.Cells(sRow, 7).Formula = "=IFERROR(GETPIVOTDATA(""Hit Count""," & pvtRef2 & _
+            ",""Month"",""" & mLabel & """)/GETPIVOTDATA(""Forecast Count""," & pvtRef2 & _
+            ",""Month"",""" & mLabel & """),NA())"
+        chartWs.Cells(sRow, 7).NumberFormat = "0.0%"
+    Next m
+    
+    Dim lastStageRow As Long
+    lastStageRow = 1 + monthsCount
+    chartWs.Columns("A:G").AutoFit
+    
+    ' =====================================================
+    ' 7. Build the combo chart (stacked columns + CEI line)
+    ' =====================================================
+    Dim co As ChartObject
+    Set co = chartWs.ChartObjects.Add(Left:=chartWs.Range("I2").Left, Top:=chartWs.Range("I2").Top, _
+                                      Width:=720, Height:=420)
+    With co.Chart
+        .SetSourceData Source:=Union(chartWs.Range("A1:E" & lastStageRow), _
+                                     chartWs.Range("G1:G" & lastStageRow))
+        .ChartType = xlColumnStacked
+        
+        ' Category colors
+        .SeriesCollection(CAT_HIT).Format.Fill.ForeColor.RGB = RGB(68, 114, 196)    ' Blue
+        .SeriesCollection(CAT_1).Format.Fill.ForeColor.RGB = RGB(255, 192, 0)       ' Yellow
+        .SeriesCollection(CAT_2).Format.Fill.ForeColor.RGB = RGB(237, 125, 49)      ' Orange
+        .SeriesCollection(CAT_3).Format.Fill.ForeColor.RGB = RGB(192, 0, 0)         ' Red
+        
+        ' CEI as a line on the secondary axis with % data labels
+        With .SeriesCollection("CEI")
+            .ChartType = xlLineMarkers
+            .AxisGroup = xlSecondary
+            .Format.Line.ForeColor.RGB = RGB(64, 64, 64)
+            .MarkerBackgroundColor = RGB(64, 64, 64)
+            .HasDataLabels = True
+            .DataLabels.NumberFormat = "0%"
+            .DataLabels.Position = xlLabelPositionAbove
+            .DataLabels.Font.Bold = True
+        End With
+        
+        With .Axes(xlValue, xlSecondary)
+            .MinimumScale = 0
+            .MaximumScale = 1
+            .TickLabels.NumberFormat = "0%"
+        End With
+        
+        .HasTitle = True
+        .ChartTitle.Text = "CEI Analysis: " & Format(winStart, "mm/dd/yyyy") & " - " & Format(winEnd, "mm/dd/yyyy")
+        .Axes(xlValue, xlPrimary).HasTitle = True
+        .Axes(xlValue, xlPrimary).AxisTitle.Text = "Task Count"
+        .HasLegend = True
+        .Legend.Position = xlLegendPositionBottom
+    End With
+    
+    ' =====================================================
+    ' 8. Slicers for CAM and IPT (connected to BOTH pivots)
+    ' =====================================================
+    Dim scCAM As SlicerCache, scIPT As SlicerCache
+    
+    If camCol > 0 Then
+        Set scCAM = ThisWorkbook.SlicerCaches.Add2(pt, HDR_CAM, "scCEI_CAM")
+        scCAM.PivotTables.AddPivotTable pt2
+        scCAM.Slicers.Add chartWs, , "CAM Slicer", "CAM", _
+            co.Top, co.Left + co.Width + 15, 140, 200
+    End If
+    If iptCol > 0 Then
+        Set scIPT = ThisWorkbook.SlicerCaches.Add2(pt, HDR_IPT, "scCEI_IPT")
+        scIPT.PivotTables.AddPivotTable pt2
+        scIPT.Slicers.Add chartWs, , "IPT Slicer", "IPT", _
+            co.Top + 215, co.Left + co.Width + 15, 140, 200
+    End If
+    
+    ' Header formatting for the staging table
+    With chartWs.Range("A1:G1")
+        .Font.Bold = True
+        .Interior.Color = RGB(217, 225, 242)
+    End With
+    
+    Application.ScreenUpdating = True
+    
+    MsgBox "CEI analysis complete!" & vbNewLine & vbNewLine & _
+           barCount & " tasks in the CEI window (stacked bars)." & vbNewLine & _
+           "CEI is calculated month-to-month: tasks forecasted for month M in the prior " & _
+           "month's snapshot vs. how many held in month M." & vbNewLine & vbNewLine & _
+           "Slice the chart using the CAM / IPT slicers on '" & CHART_SHEET & "'." & vbNewLine & _
+           "Double-click any number in either PivotTable on '" & DATA_SHEET & "' to drill down.", vbInformation
+
+End Sub
+
+' --- Prompts for a date, returns False if user cancels ---
+Private Function PromptForDate(promptText As String, ByRef result As Date) As Boolean
+    Dim v As Variant
+    Do
+        v = Application.InputBox(promptText, "CEI Window", Type:=2)
+        If VarType(v) = vbBoolean Then Exit Function   ' user cancelled
+        If IsDate(v) Then
+            result = CDate(v)
+            PromptForDate = True
+            Exit Function
+        End If
+        MsgBox "'" & v & "' is not a valid date. Please try again.", vbExclamation
+    Loop
+End Function
+
+' --- Finds a header in row 1; tries an exact match first, then a partial match ---
+Private Function FindHeader(ws As Worksheet, headerText As String) As Long
+    Dim c As Range, lastCol As Long
+    lastCol = ws.Cells(1, ws.Columns.Count).End(xlToLeft).Column
+    
+    For Each c In ws.Range(ws.Cells(1, 1), ws.Cells(1, lastCol))
+        If StrComp(Trim(CStr(c.Value)), headerText, vbTextCompare) = 0 Then
+            FindHeader = c.Column
+            Exit Function
+        End If
+    Next c
+    
+    For Each c In ws.Range(ws.Cells(1, 1), ws.Cells(1, lastCol))
+        If InStr(1, CStr(c.Value), headerText, vbTextCompare) > 0 Then
+            FindHeader = c.Column
+            Exit Function
+        End If
+    Next c
+    
+    FindHeader = 0
+End Function
