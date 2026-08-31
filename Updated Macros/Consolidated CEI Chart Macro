@@ -1,0 +1,289 @@
+Option Explicit
+
+'=====================================================================
+' CEI CHART GENERATOR
+' Source tab: "CEI ASOT"
+' Headers expected in row 1: Task ID, Task Name, CAM, IPT,
+'   plus any number of "[mm-yyyy] Start" and "[mm-yyyy] Finish" columns
+'   (e.g. "01-2025 Finish").
+'
+' Run:  Build_CEI_HitMiss_Chart      -> "CEI HitMiss" sheet
+'       Build_CEI_MissSeverity_Chart -> "CEI Severity" sheet
+'=====================================================================
+
+Private Const SRC_SHEET As String = "CEI ASOT"
+
+Public Sub Build_CEI_HitMiss_Chart()
+    BuildCEIChart 1
+End Sub
+
+Public Sub Build_CEI_MissSeverity_Chart()
+    BuildCEIChart 2
+End Sub
+
+'---------------------------------------------------------------------
+Private Sub BuildCEIChart(ByVal mode As Long)
+    ' mode 1 = Hit/Miss (count of snapshot mismatches vs. baseline)
+    ' mode 2 = Miss Severity (months between earliest & latest finish)
+
+    Dim wsSrc As Worksheet, wsOut As Worksheet
+    Dim wb As Workbook
+    Set wb = ThisWorkbook
+
+    On Error Resume Next
+    Set wsSrc = wb.Worksheets(SRC_SHEET)
+    On Error GoTo 0
+    If wsSrc Is Nothing Then
+        MsgBox "Could not find a tab named '" & SRC_SHEET & "'.", vbCritical
+        Exit Sub
+    End If
+
+    '--- Locate columns -------------------------------------------------
+    Dim lastCol As Long, lastRow As Long, c As Long
+    lastCol = wsSrc.Cells(1, wsSrc.Columns.Count).End(xlToLeft).Column
+    lastRow = wsSrc.Cells(wsSrc.Rows.Count, 1).End(xlUp).Row
+
+    Dim colID As Long, colName As Long, colCAM As Long, colIPT As Long
+    Dim finCols() As Long, finDates() As Date, nFin As Long
+    ReDim finCols(1 To lastCol): ReDim finDates(1 To lastCol)
+
+    Dim hdr As String, snapDate As Date
+    For c = 1 To lastCol
+        hdr = Trim$(CStr(wsSrc.Cells(1, c).Value))
+        Select Case LCase$(hdr)
+            Case "task id":   colID = c
+            Case "task name": colName = c
+            Case "cam":       colCAM = c
+            Case "ipt":       colIPT = c
+            Case Else
+                If TryParseSnapshotHeader(hdr, "finish", snapDate) Then
+                    nFin = nFin + 1
+                    finCols(nFin) = c
+                    finDates(nFin) = snapDate
+                End If
+        End Select
+    Next c
+
+    If colID = 0 Or colCAM = 0 Or nFin = 0 Then
+        MsgBox "Required headers not found. Need 'Task ID', 'CAM', and at least one '[mm-yyyy] Finish' column.", vbCritical
+        Exit Sub
+    End If
+
+    '--- Sort finish snapshot columns chronologically -------------------
+    Dim i As Long, j As Long, tD As Date, tC As Long
+    For i = 1 To nFin - 1
+        For j = i + 1 To nFin
+            If finDates(j) < finDates(i) Then
+                tD = finDates(i): finDates(i) = finDates(j): finDates(j) = tD
+                tC = finCols(i): finCols(i) = finCols(j): finCols(j) = tC
+            End If
+        Next j
+    Next i
+
+    '--- Prompt for the CEI window --------------------------------------
+    Dim dStart As Date, dEnd As Date
+    If Not PromptForMonth("Enter the CEI Window START date" & vbCrLf & _
+        "(formats accepted: mm-yyyy, mm/yyyy, or a full date):", dStart) Then Exit Sub
+    If Not PromptForMonth("Enter the CEI Window FINISH date" & vbCrLf & _
+        "(formats accepted: mm-yyyy, mm/yyyy, or a full date):", dEnd) Then Exit Sub
+    If dEnd < dStart Then
+        MsgBox "The Finish date must not be earlier than the Start date.", vbExclamation
+        Exit Sub
+    End If
+
+    '--- Build staging data ---------------------------------------------
+    Application.ScreenUpdating = False
+
+    Dim outName As String, catField As String, chartTitle As String
+    Dim labels(0 To 3) As String
+    If mode = 1 Then
+        outName = "CEI HitMiss"
+        chartTitle = "CEI Hit/Miss"
+        labels(0) = "Hits": labels(1) = "1 Miss"
+        labels(2) = "2 Miss": labels(3) = "3 Miss"
+    Else
+        outName = "CEI Severity"
+        chartTitle = "CEI Miss Severity"
+        labels(0) = "Hits": labels(1) = "1 Month"
+        labels(2) = "2 Months": labels(3) = "3+ Months"
+    End If
+    catField = "Category"
+
+    ' Remove any prior slicer cache & sheet for a clean rebuild
+    DeleteSlicerCacheByName wb, "SC_CAM_" & Replace(outName, " ", "")
+    Application.DisplayAlerts = False
+    On Error Resume Next
+    wb.Worksheets(outName).Delete
+    On Error GoTo 0
+    Application.DisplayAlerts = True
+
+    Set wsOut = wb.Worksheets.Add(After:=wb.Worksheets(wb.Worksheets.Count))
+    wsOut.Name = outName
+
+    wsOut.Range("A1:F1").Value = Array("Task ID", "Task Name", "CAM", "IPT", "Finish Month", catField)
+
+    Dim r As Long, outRow As Long, v As Variant
+    Dim baseFloor As Date, curFloor As Date, lastFloor As Date
+    Dim haveBase As Boolean, misses As Long, diff As Long, k As Long
+    outRow = 2
+
+    For r = 2 To lastRow
+        haveBase = False
+        misses = 0
+
+        ' Baseline = earliest non-blank Finish snapshot (original forecast)
+        For k = 1 To nFin
+            v = wsSrc.Cells(r, finCols(k)).Value
+            If IsDate(v) Then
+                If Not haveBase Then
+                    baseFloor = MonthFloor(CDate(v))
+                    lastFloor = baseFloor
+                    haveBase = True
+                Else
+                    curFloor = MonthFloor(CDate(v))
+                    lastFloor = curFloor              ' tracks latest snapshot's finish
+                    If curFloor <> baseFloor Then misses = misses + 1
+                End If
+            End If
+        Next k
+
+        If haveBase Then
+            ' Keep only tasks whose ORIGINAL forecast finish falls in the window
+            If baseFloor >= MonthFloor(dStart) And baseFloor <= MonthFloor(dEnd) Then
+                If mode = 1 Then
+                    If misses > 3 Then misses = 3      ' cap at "3 Miss"
+                    diff = misses
+                Else
+                    diff = Abs(DateDiff("m", baseFloor, lastFloor))
+                    If diff > 3 Then diff = 3          ' cap at "3+ Months"
+                End If
+                wsOut.Cells(outRow, 1).Value = wsSrc.Cells(r, colID).Value
+                If colName > 0 Then wsOut.Cells(outRow, 2).Value = wsSrc.Cells(r, colName).Value
+                wsOut.Cells(outRow, 3).Value = wsSrc.Cells(r, colCAM).Value
+                If colIPT > 0 Then wsOut.Cells(outRow, 4).Value = wsSrc.Cells(r, colIPT).Value
+                wsOut.Cells(outRow, 5).Value = baseFloor
+                wsOut.Cells(outRow, 6).Value = labels(diff)
+                outRow = outRow + 1
+            End If
+        End If
+    Next r
+
+    If outRow = 2 Then
+        Application.ScreenUpdating = True
+        MsgBox "No tasks were forecasted to finish within the selected window.", vbInformation
+        Exit Sub
+    End If
+
+    wsOut.Range(wsOut.Cells(2, 5), wsOut.Cells(outRow - 1, 5)).NumberFormat = "mmm-yyyy"
+    wsOut.Columns("A:F").AutoFit
+
+    '--- Pivot table -----------------------------------------------------
+    Dim rngData As Range, pc As PivotCache, pt As PivotTable
+    Set rngData = wsOut.Range(wsOut.Cells(1, 1), wsOut.Cells(outRow - 1, 6))
+    Set pc = wb.PivotCaches.Create(xlDatabase, rngData)
+    Set pt = pc.CreatePivotTable(wsOut.Range("H1"), "PT_" & Replace(outName, " ", ""))
+
+    With pt
+        .PivotFields("Finish Month").Orientation = xlRowField
+        .PivotFields(catField).Orientation = xlColumnField
+        .AddDataField .PivotFields("Task ID"), "Task Count", xlCount
+        .ColumnGrand = False
+        .RowGrand = False
+        .PivotFields("Finish Month").NumberFormat = "mmm-yyyy"
+    End With
+
+    ' Force category order: Hits, 1, 2, 3
+    On Error Resume Next
+    For i = 0 To 3
+        pt.PivotFields(catField).PivotItems(labels(i)).Position = i + 1
+    Next i
+    On Error GoTo 0
+
+    '--- Pivot chart -----------------------------------------------------
+    Dim shp As Shape, cht As Chart, srs As Series
+    Set shp = wsOut.Shapes.AddChart2(297, xlColumnStacked, _
+              wsOut.Range("H2").Left, wsOut.Range("H2").Top + 220, 620, 340)
+    Set cht = shp.Chart
+    cht.SetSourceData pt.TableRange1
+    cht.ChartType = xlColumnStacked
+    cht.HasTitle = True
+    cht.ChartTitle.Text = chartTitle & "  (" & Format(dStart, "mmm-yyyy") & _
+                          " through " & Format(dEnd, "mmm-yyyy") & ")"
+
+    For Each srs In cht.SeriesCollection
+        Select Case srs.Name
+            Case labels(0): srs.Format.Fill.ForeColor.RGB = RGB(68, 114, 196)   ' Blue
+            Case labels(1): srs.Format.Fill.ForeColor.RGB = RGB(255, 192, 0)    ' Yellow
+            Case labels(2): srs.Format.Fill.ForeColor.RGB = RGB(237, 125, 49)   ' Orange
+            Case labels(3): srs.Format.Fill.ForeColor.RGB = RGB(255, 0, 0)      ' Red
+        End Select
+    Next srs
+
+    '--- CAM slicer -------------------------------------------------------
+    Dim sc As SlicerCache
+    Set sc = wb.SlicerCaches.Add2(pt, "CAM", "SC_CAM_" & Replace(outName, " ", ""))
+    sc.Slicers.Add wsOut, , "Slicer_CAM_" & Replace(outName, " ", ""), "CAM", _
+                   wsOut.Range("H2").Top + 220, shp.Left + shp.Width + 15, 150, 220
+
+    Application.ScreenUpdating = True
+    wsOut.Activate
+    MsgBox chartTitle & " generated on sheet '" & outName & "'.", vbInformation
+End Sub
+
+'---------------------------------------------------------------------
+' Parses headers like "01-2025 Finish" (or "01/2025 Finish").
+Private Function TryParseSnapshotHeader(ByVal hdr As String, _
+        ByVal kind As String, ByRef result As Date) As Boolean
+    Dim parts() As String, dPart As String, seg() As String
+    If Len(hdr) <= Len(kind) Then Exit Function
+    If LCase$(Right$(hdr, Len(kind))) <> LCase$(kind) Then Exit Function
+    dPart = Trim$(Left$(hdr, Len(hdr) - Len(kind)))
+    dPart = Replace(dPart, "/", "-")
+    seg = Split(dPart, "-")
+    If UBound(seg) <> 1 Then Exit Function
+    If Not IsNumeric(seg(0)) Or Not IsNumeric(seg(1)) Then Exit Function
+    If CLng(seg(0)) < 1 Or CLng(seg(0)) > 12 Then Exit Function
+    result = DateSerial(CLng(seg(1)), CLng(seg(0)), 1)
+    TryParseSnapshotHeader = True
+End Function
+
+'---------------------------------------------------------------------
+Private Function PromptForMonth(ByVal msg As String, ByRef result As Date) As Boolean
+    Dim s As String, seg() As String
+    Do
+        s = Trim$(InputBox(msg, "CEI Window"))
+        If Len(s) = 0 Then Exit Function        ' user cancelled
+        s = Replace(s, "/", "-")
+        seg = Split(s, "-")
+        If UBound(seg) = 1 Then
+            If IsNumeric(seg(0)) And IsNumeric(seg(1)) Then
+                If CLng(seg(0)) >= 1 And CLng(seg(0)) <= 12 Then
+                    result = DateSerial(CLng(seg(1)), CLng(seg(0)), 1)
+                    PromptForMonth = True
+                    Exit Function
+                End If
+            End If
+        End If
+        If IsDate(s) Then
+            result = MonthFloor(CDate(s))
+            PromptForMonth = True
+            Exit Function
+        End If
+        MsgBox "Could not read '" & s & "' as a date. Please try again.", vbExclamation
+    Loop
+End Function
+
+'---------------------------------------------------------------------
+Private Function MonthFloor(ByVal d As Date) As Date
+    MonthFloor = DateSerial(Year(d), Month(d), 1)
+End Function
+
+'---------------------------------------------------------------------
+Private Sub DeleteSlicerCacheByName(ByVal wb As Workbook, ByVal nm As String)
+    Dim sc As SlicerCache
+    On Error Resume Next
+    For Each sc In wb.SlicerCaches
+        If sc.Name = nm Then sc.Delete
+    Next sc
+    On Error GoTo 0
+End Sub
