@@ -33,7 +33,7 @@ Private Const LAG_PERCENT As Long = 2
 
 ' ---- node display info ------------------------------------------------------
 Private mProjDisp() As String
-Private mID() As Long
+Private mTaskID() As Long
 
 ' ---- incoming-edge storage (predecessor -> task), linked lists in arrays ----
 Private mInHead() As Long       ' mInHead(task) = first incoming edge (0 = none)
@@ -128,7 +128,7 @@ Public Sub DrivingPathToPUID()
     Set puidIdx = CreateObject("Scripting.Dictionary"): puidIdx.CompareMode = vbTextCompare
 
     ReDim nodeRow(1 To nRows): ReDim nodeProjKey(1 To nRows)
-    ReDim mProjDisp(1 To nRows): ReDim mID(1 To nRows)
+    ReDim mProjDisp(1 To nRows): ReDim mTaskID(1 To nRows)
     ReDim nStart(1 To nRows): ReDim nFin(1 To nRows): ReDim nodeUnres(1 To nRows)
 
     n = 0
@@ -145,7 +145,7 @@ Public Sub DrivingPathToPUID()
                     nodeRow(n) = r
                     nodeProjKey(n) = UCase$(sProj)
                     mProjDisp(n) = sProj
-                    mID(n) = idVal
+                    mTaskID(n) = idVal
                     nStart(n) = DPDateVal(data(r, cStart))
                     nFin(n) = DPDateVal(data(r, cFin))
                     If Not projDict.Exists(UCase$(sProj)) Then projDict.Add UCase$(sProj), sProj
@@ -688,7 +688,7 @@ Private Function DPBefore(ByVal a As Long, ByVal b As Long, ByRef nStart() As Do
 End Function
 
 Private Function DPLabel(ByVal v As Long) As String
-    DPLabel = mProjDisp(v) & "\" & mID(v)
+    DPLabel = mProjDisp(v) & "\" & mTaskID(v)
 End Function
 
 Private Function DPSafeStr(ByVal x As Variant) As String
