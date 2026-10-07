@@ -1,0 +1,751 @@
+Option Explicit
+
+'==============================================================================
+'  DRIVING PATH FINDER – MS Project Master/Subproject Excel export
+'
+'  Prompts for a PUID and traces the driving path backward from that task,
+'  following local AND cross-project links (<>\...\Project_IMS\ID).
+'
+'  "Driving" is derived from the export (no Driving Predecessor flag exists):
+'    * each predecessor link is parsed for type (FS/SS/FF/SF) and lag
+'      (days, wks, mons, hrs, mins, e-prefixed elapsed units, % of duration)
+'    * the date the link REQUIRES the successor to Start (FS/SS) or Finish
+'      (FF/SF) is computed on a Mon-Fri calendar
+'    * gap = working days between the required date and the actual date
+'    * the predecessor(s) with the smallest gap are driving if that gap is
+'      within DRIVING_TOLERANCE_WD.  Ties are all followed (path branches).
+'    * if nothing is within tolerance the task is treated as a PATH START
+'      (constraint / actuals / calendar-driven) unless
+'      FOLLOW_NEAREST_WHEN_NONE_DRIVING = True, in which case the nearest
+'      predecessor is followed and flagged NEAR-DRIVING.
+'
+'  Output tab "DP to [PUID]" lists every task on the path, chronologically,
+'  with the relationship to the next task on the path, the date the link
+'  requires, the gap, and a role/notes column.   No clipboard is used.
+'==============================================================================
+
+Private Const DRIVING_TOLERANCE_WD As Long = 1                    ' working days
+Private Const FOLLOW_NEAREST_WHEN_NONE_DRIVING As Boolean = False
+
+Private Const LAG_WORKING As Long = 0
+Private Const LAG_ELAPSED As Long = 1
+Private Const LAG_PERCENT As Long = 2
+
+' ---- node display info ------------------------------------------------------
+Private mProjDisp() As String
+Private mID() As Long
+
+' ---- incoming-edge storage (predecessor -> task), linked lists in arrays ----
+Private mInHead() As Long       ' mInHead(task) = first incoming edge (0 = none)
+Private mInNext() As Long
+Private mInSrc() As Long        ' predecessor node
+Private mLnkType() As String    ' FS / SS / FF / SF
+Private mLnkLag() As Double     ' lag in working days, elapsed days, or percent
+Private mLnkKind() As Long      ' LAG_WORKING / LAG_ELAPSED / LAG_PERCENT
+Private mLnkDesc() As String    ' e.g. "FS+2 days"
+Private mEdgeCount As Long
+Private mEdgeDict As Object
+
+'==============================================================================
+Public Sub DrivingPathToPUID()
+
+    Dim wb As Workbook, wsSrc As Worksheet, wsOut As Worksheet
+    Dim hdrRow As Long, lastRow As Long, lastCol As Long
+    Dim cID As Long, cProj As Long, cPUID As Long, cName As Long, cStart As Long, cFin As Long
+    Dim cPred As Long, cSucc As Long, cTS As Long
+    Dim data As Variant, hdrs As Variant, items As Variant
+    Dim nRows As Long, r As Long, c As Long, n As Long, v As Long, p As Long, e As Long, k As Long, i As Long, j As Long
+    Dim taskIdx As Object, projDict As Object, resolveCache As Object, puidIdx As Object
+    Dim nodeRow() As Long, nodeProjKey() As String, nStart() As Double, nFin() As Double, nodeUnres() As String
+    Dim sID As String, sProj As String, sPUID As String, key As String, idVal As Long
+    Dim lProj As String, lID As Long, lType As String, lLag As Double, lKind As Long, lDesc As String, resolvedProj As String
+    Dim targetPUID As String, target As Long, dupPUID As Long, unresolvedCnt As Long
+    Dim prevScreen As Boolean, prevEvents As Boolean, prevCalc As XlCalculation, prevAlerts As Boolean
+    Dim t0 As Single
+
+    Set wb = ActiveWorkbook
+    Set wsSrc = ActiveSheet
+
+    '--------------------------------------------------------------------------
+    ' 1. Header / columns
+    '--------------------------------------------------------------------------
+    hdrRow = DPFindHeaderRow(wsSrc)
+    If hdrRow = 0 Then
+        MsgBox "Could not find a header row containing 'ID' and 'Predecessors' on sheet '" & _
+               wsSrc.Name & "'. Make the export sheet active and try again.", vbExclamation
+        Exit Sub
+    End If
+    lastCol = wsSrc.Cells(hdrRow, wsSrc.Columns.Count).End(xlToLeft).Column
+    cID = DPFindCol(wsSrc, hdrRow, lastCol, "ID")
+    cProj = DPFindCol(wsSrc, hdrRow, lastCol, "Project")
+    cPUID = DPFindCol(wsSrc, hdrRow, lastCol, "PUID")
+    cName = DPFindCol(wsSrc, hdrRow, lastCol, "Name")
+    cStart = DPFindCol(wsSrc, hdrRow, lastCol, "Start")
+    cFin = DPFindCol(wsSrc, hdrRow, lastCol, "Finish")
+    cPred = DPFindCol(wsSrc, hdrRow, lastCol, "Predecessors")
+    cSucc = DPFindCol(wsSrc, hdrRow, lastCol, "Successors")
+    cTS = DPFindCol(wsSrc, hdrRow, lastCol, "Total Slack")
+
+    If cID = 0 Or cProj = 0 Or cPUID = 0 Or cStart = 0 Or cFin = 0 Or cPred = 0 Or cSucc = 0 Then
+        MsgBox "Missing one or more required columns (ID, Project, PUID, Start, Finish, Predecessors, Successors).", vbExclamation
+        Exit Sub
+    End If
+    lastRow = wsSrc.Cells(wsSrc.Rows.Count, cID).End(xlUp).Row
+    If lastRow <= hdrRow Then
+        MsgBox "No data rows found below the header.", vbInformation
+        Exit Sub
+    End If
+
+    '--------------------------------------------------------------------------
+    ' 2. Prompt for PUID
+    '--------------------------------------------------------------------------
+    targetPUID = Trim$(InputBox("Enter the PUID of the task to trace the Driving Path to:", "Driving Path Finder"))
+    If Len(targetPUID) = 0 Then Exit Sub
+
+    prevScreen = Application.ScreenUpdating
+    prevEvents = Application.EnableEvents
+    prevCalc = Application.Calculation
+    Application.ScreenUpdating = False
+    Application.EnableEvents = False
+    Application.Calculation = xlCalculationManual
+    Application.StatusBar = "Driving path: reading data..."
+    On Error GoTo CleanFail
+    t0 = Timer
+
+    '--------------------------------------------------------------------------
+    ' 3. Read into arrays (no clipboard)
+    '--------------------------------------------------------------------------
+    data = wsSrc.Range(wsSrc.Cells(hdrRow + 1, 1), wsSrc.Cells(lastRow, lastCol)).Value
+    hdrs = wsSrc.Range(wsSrc.Cells(hdrRow, 1), wsSrc.Cells(hdrRow, lastCol)).Value
+    nRows = UBound(data, 1)
+
+    '--------------------------------------------------------------------------
+    ' 4. Node table  (key = UCASE(Project) & "\" & ID)
+    '--------------------------------------------------------------------------
+    Set taskIdx = CreateObject("Scripting.Dictionary"): taskIdx.CompareMode = vbTextCompare
+    Set projDict = CreateObject("Scripting.Dictionary"): projDict.CompareMode = vbTextCompare
+    Set resolveCache = CreateObject("Scripting.Dictionary"): resolveCache.CompareMode = vbTextCompare
+    Set puidIdx = CreateObject("Scripting.Dictionary"): puidIdx.CompareMode = vbTextCompare
+
+    ReDim nodeRow(1 To nRows): ReDim nodeProjKey(1 To nRows)
+    ReDim mProjDisp(1 To nRows): ReDim mID(1 To nRows)
+    ReDim nStart(1 To nRows): ReDim nFin(1 To nRows): ReDim nodeUnres(1 To nRows)
+
+    n = 0
+    For r = 1 To nRows
+        sID = Trim$(DPSafeStr(data(r, cID)))
+        If Len(sID) > 0 Then
+            If IsNumeric(sID) Then
+                idVal = CLng(Val(sID))
+                sProj = Trim$(DPSafeStr(data(r, cProj)))
+                key = UCase$(sProj) & "\" & CStr(idVal)
+                If Not taskIdx.Exists(key) Then
+                    n = n + 1
+                    taskIdx.Add key, n
+                    nodeRow(n) = r
+                    nodeProjKey(n) = UCase$(sProj)
+                    mProjDisp(n) = sProj
+                    mID(n) = idVal
+                    nStart(n) = DPDateVal(data(r, cStart))
+                    nFin(n) = DPDateVal(data(r, cFin))
+                    If Not projDict.Exists(UCase$(sProj)) Then projDict.Add UCase$(sProj), sProj
+                    sPUID = Trim$(DPSafeStr(data(r, cPUID)))
+                    If Len(sPUID) > 0 Then
+                        If puidIdx.Exists(sPUID) Then
+                            If StrComp(sPUID, targetPUID, vbTextCompare) = 0 Then dupPUID = dupPUID + 1
+                        Else
+                            puidIdx.Add sPUID, n
+                        End If
+                    End If
+                End If
+            End If
+        End If
+    Next r
+
+    If n = 0 Then
+        MsgBox "No rows with a numeric ID were found.", vbInformation
+        GoTo CleanExit
+    End If
+    If Not puidIdx.Exists(targetPUID) Then
+        MsgBox "PUID '" & targetPUID & "' was not found in the '" & DPSafeStr(hdrs(1, cPUID)) & "' column.", vbExclamation
+        GoTo CleanExit
+    End If
+    target = puidIdx(targetPUID)
+    If nStart(target) = 0 And nFin(target) = 0 Then
+        MsgBox "The target task has no usable Start/Finish dates, so a driving path cannot be evaluated.", vbExclamation
+        GoTo CleanExit
+    End If
+
+    '--------------------------------------------------------------------------
+    ' 5. Build incoming edges from Predecessors (p -> v) and Successors (v -> s)
+    '--------------------------------------------------------------------------
+    Application.StatusBar = "Driving path: building dependency graph..."
+    DPInitGraph n
+
+    For v = 1 To n
+        r = nodeRow(v)
+
+        items = DPSplitLinks(DPSafeStr(data(r, cPred)))
+        For k = LBound(items) To UBound(items)
+            If DPParseLink(items(k), nodeProjKey(v), lProj, lID, lType, lLag, lKind, lDesc) Then
+                resolvedProj = DPResolveProject(lProj, projDict, resolveCache)
+                key = resolvedProj & "\" & CStr(lID)
+                If Len(resolvedProj) > 0 And taskIdx.Exists(key) Then
+                    DPAddInEdge taskIdx(key), v, lType, lLag, lKind, lDesc
+                Else
+                    unresolvedCnt = unresolvedCnt + 1
+                    nodeUnres(v) = nodeUnres(v) & IIf(Len(nodeUnres(v)) > 0, ", ", "") & Trim$(items(k))
+                End If
+            End If
+        Next k
+
+        items = DPSplitLinks(DPSafeStr(data(r, cSucc)))
+        For k = LBound(items) To UBound(items)
+            If DPParseLink(items(k), nodeProjKey(v), lProj, lID, lType, lLag, lKind, lDesc) Then
+                resolvedProj = DPResolveProject(lProj, projDict, resolveCache)
+                key = resolvedProj & "\" & CStr(lID)
+                If Len(resolvedProj) > 0 And taskIdx.Exists(key) Then
+                    DPAddInEdge v, taskIdx(key), lType, lLag, lKind, lDesc
+                Else
+                    unresolvedCnt = unresolvedCnt + 1
+                End If
+            End If
+        Next k
+    Next v
+
+    '--------------------------------------------------------------------------
+    ' 6. Backward trace from target through driving predecessors
+    '--------------------------------------------------------------------------
+    Application.StatusBar = "Driving path: tracing..."
+
+    Dim visited() As Boolean, lvl() As Long, drives() As String, linkTo() As String
+    Dim impDate() As Double, gapWD() As Double, hasGap() As Boolean, status() As String
+    Dim queue() As Long, qh As Long, qt As Long
+    Dim minGap As Double, g As Double, imp As Double, cntTotal As Long, cntValid As Long, nearestE As Long
+    Dim pathTasks As Long, startCnt As Long
+
+    ReDim visited(1 To n): ReDim lvl(1 To n): ReDim drives(1 To n): ReDim linkTo(1 To n)
+    ReDim impDate(1 To n): ReDim gapWD(1 To n): ReDim hasGap(1 To n): ReDim status(1 To n)
+    ReDim queue(1 To n)
+
+    visited(target) = True: lvl(target) = 0: status(target) = "TARGET"
+    qh = 0: qt = 1: queue(1) = target: pathTasks = 1
+
+    Do While qh < qt
+        qh = qh + 1
+        v = queue(qh)
+
+        ' pass 1 – find the tightest (latest-required) predecessor
+        cntTotal = 0: cntValid = 0: minGap = 1E+99: nearestE = 0
+        e = mInHead(v)
+        Do While e <> 0
+            p = mInSrc(e)
+            cntTotal = cntTotal + 1
+            If DPEvalLink(e, p, v, nStart, nFin, imp, g) Then
+                cntValid = cntValid + 1
+                If g < minGap Then minGap = g: nearestE = e
+            End If
+            e = mInNext(e)
+        Loop
+
+        If cntTotal = 0 Then
+            startCnt = startCnt + 1
+            status(v) = status(v) & " | PATH START - no predecessors found in export" & _
+                        IIf(Len(nodeUnres(v)) > 0, " (unresolved links: " & nodeUnres(v) & ")", "")
+        ElseIf cntValid = 0 Then
+            startCnt = startCnt + 1
+            status(v) = status(v) & " | PATH START - predecessors have no usable Start/Finish dates"
+        ElseIf minGap > DRIVING_TOLERANCE_WD And Not FOLLOW_NEAREST_WHEN_NONE_DRIVING Then
+            startCnt = startCnt + 1
+            p = mInSrc(nearestE)
+            status(v) = status(v) & " | PATH START - no driving predecessor; nearest is " & DPLabel(p) & _
+                        " (" & mLnkDesc(nearestE) & ", gap " & minGap & " wd). Task likely driven by a constraint, actuals, or calendar."
+        Else
+            ' pass 2 – follow every predecessor that ties for the tightest gap
+            e = mInHead(v)
+            Do While e <> 0
+                p = mInSrc(e)
+                If DPEvalLink(e, p, v, nStart, nFin, imp, g) Then
+                    If g = minGap Then
+                        If Not visited(p) Then
+                            visited(p) = True
+                            lvl(p) = lvl(v) + 1
+                            qt = qt + 1: queue(qt) = p
+                            pathTasks = pathTasks + 1
+                            drives(p) = DPLabel(v)
+                            linkTo(p) = mLnkDesc(e)
+                            impDate(p) = imp: gapWD(p) = g: hasGap(p) = True
+                            If minGap > DRIVING_TOLERANCE_WD Then
+                                status(p) = "NEAR-DRIVING (gap exceeds tolerance - followed as nearest predecessor)"
+                            ElseIf g < 0 Then
+                                status(p) = "DRIVING (link violated - successor dates are earlier than the link allows)"
+                            Else
+                                status(p) = "DRIVING"
+                            End If
+                        Else
+                            drives(p) = drives(p) & "; " & DPLabel(v)   ' converging paths / loop
+                        End If
+                    End If
+                End If
+                e = mInNext(e)
+            Loop
+            If Len(nodeUnres(v)) > 0 Then status(v) = status(v) & " | unresolved predecessor links: " & nodeUnres(v)
+        End If
+    Loop
+
+    '--------------------------------------------------------------------------
+    ' 7. Order chronologically (Start, Finish, deeper level first)
+    '--------------------------------------------------------------------------
+    Dim ord() As Long, cnt As Long, gapS As Long, tmp As Long
+    ReDim ord(1 To pathTasks)
+    cnt = 0
+    For v = 1 To n
+        If visited(v) Then cnt = cnt + 1: ord(cnt) = v
+    Next v
+
+    gapS = cnt \ 2
+    Do While gapS > 0
+        For i = gapS + 1 To cnt
+            tmp = ord(i): j = i
+            Do While j > gapS
+                If DPBefore(tmp, ord(j - gapS), nStart, nFin, lvl) Then
+                    ord(j) = ord(j - gapS): j = j - gapS
+                Else
+                    Exit Do
+                End If
+            Loop
+            ord(j) = tmp
+        Next i
+        gapS = gapS \ 2
+    Loop
+
+    '--------------------------------------------------------------------------
+    ' 8. Output
+    '--------------------------------------------------------------------------
+    Application.StatusBar = "Driving path: writing results..."
+
+    Dim outArr As Variant, oc As Long, rowI As Long
+    oc = lastCol + 7
+    ReDim outArr(1 To cnt + 1, 1 To oc)
+    outArr(1, 1) = "Seq"
+    outArr(1, 2) = "Steps To Target"
+    For c = 1 To lastCol: outArr(1, c + 2) = hdrs(1, c): Next c
+    outArr(1, lastCol + 3) = "Relationship To Next Task"
+    outArr(1, lastCol + 4) = "Next Task On Path (Project\ID)"
+    outArr(1, lastCol + 5) = "Date Required By Link"
+    outArr(1, lastCol + 6) = "Gap (work days)"
+    outArr(1, lastCol + 7) = "Path Role / Notes"
+
+    For i = 1 To cnt
+        v = ord(i): rowI = i + 1
+        outArr(rowI, 1) = i
+        outArr(rowI, 2) = lvl(v)
+        For c = 1 To lastCol: outArr(rowI, c + 2) = data(nodeRow(v), c): Next c
+        If hasGap(v) Then
+            outArr(rowI, lastCol + 3) = linkTo(v)
+            outArr(rowI, lastCol + 4) = drives(v)
+            outArr(rowI, lastCol + 5) = CDate(impDate(v))
+            outArr(rowI, lastCol + 6) = gapWD(v)
+        ElseIf Len(drives(v)) > 0 Then
+            outArr(rowI, lastCol + 4) = drives(v)
+        End If
+        outArr(rowI, lastCol + 7) = status(v)
+    Next i
+
+    Dim shName As String
+    shName = DPSafeSheetName("DP to " & targetPUID)
+    If DPSheetExists(wb, shName) Then
+        prevAlerts = Application.DisplayAlerts
+        Application.DisplayAlerts = False
+        wb.Worksheets(shName).Delete
+        Application.DisplayAlerts = prevAlerts
+    End If
+    Set wsOut = wb.Worksheets.Add(After:=wsSrc)
+    wsOut.Name = shName
+
+    With wsOut
+        .Cells(1, 1).Value = "DRIVING PATH TO " & DPLabel(target) & "    PUID: " & targetPUID & _
+                             IIf(cName > 0, "    " & DPSafeStr(data(nodeRow(target), cName)), "")
+        .Cells(1, 1).Font.Bold = True
+        .Cells(2, 1).Value = "Target Start: " & DPSafeStr(data(nodeRow(target), cStart)) & _
+                             "    Finish: " & DPSafeStr(data(nodeRow(target), cFin)) & _
+                             IIf(cTS > 0, "    Total Slack: " & DPSafeStr(data(nodeRow(target), cTS)), "")
+        .Cells(3, 1).Value = "Method: each predecessor link (FS/SS/FF/SF + lag) is checked against the successor's Start/Finish on a Mon-Fri calendar. " & _
+                             "A predecessor is DRIVING when it requires the latest date of all predecessors and the successor's date is within " & _
+                             DRIVING_TOLERANCE_WD & " working day(s) of it. Ties are all followed."
+        .Cells(4, 1).Value = "Tasks on path: " & cnt & "    |    Path start points: " & startCnt & _
+                             "    |    Follow nearest predecessor when none is driving: " & IIf(FOLLOW_NEAREST_WHEN_NONE_DRIVING, "Yes", "No") & _
+                             "    |    Unresolved links in export: " & unresolvedCnt & _
+                             IIf(dupPUID > 0, "    |    WARNING: PUID appears " & (dupPUID + 1) & " times - first occurrence used", "")
+        .Cells(6, 1).Resize(cnt + 1, oc).Value = outArr
+        .Cells(6, 1).Resize(1, oc).Font.Bold = True
+        .Columns(lastCol + 5).NumberFormat = "m/d/yyyy"
+        .Cells(6, 1).Resize(cnt + 1, oc).Columns.AutoFit
+        .Columns(lastCol + 7).ColumnWidth = 70
+        .Activate
+        .Range("A7").Select
+        ActiveWindow.FreezePanes = False
+        ActiveWindow.FreezePanes = True
+    End With
+
+    Application.StatusBar = False
+    MsgBox "Driving path written to tab '" & shName & "' in " & Format(Timer - t0, "0.0") & " s." & vbCrLf & vbCrLf & _
+           "Tasks on path: " & cnt & vbCrLf & _
+           "Path start points: " & startCnt & vbCrLf & _
+           "Unresolved links in export: " & unresolvedCnt, vbInformation, "Driving Path Finder"
+
+CleanExit:
+    Application.StatusBar = False
+    Application.ScreenUpdating = prevScreen
+    Application.EnableEvents = prevEvents
+    Application.Calculation = prevCalc
+    Exit Sub
+
+CleanFail:
+    MsgBox "Error " & Err.Number & ": " & Err.Description, vbCritical, "Driving Path Finder"
+    Resume CleanExit
+End Sub
+
+'==============================================================================
+'  Link evaluation – returns required date and gap (working days) for edge e
+'==============================================================================
+Private Function DPEvalLink(ByVal e As Long, ByVal p As Long, ByVal v As Long, _
+                            ByRef nStart() As Double, ByRef nFin() As Double, _
+                            ByRef imp As Double, ByRef g As Double) As Boolean
+    Dim typ As String, lag As Double, kind As Long, base As Double, actual As Double
+    Dim lagWD As Long, lagCD As Long, durWD As Long
+
+    DPEvalLink = False
+    typ = mLnkType(e): lag = mLnkLag(e): kind = mLnkKind(e)
+    If nStart(p) = 0 Or nFin(p) = 0 Then Exit Function
+
+    Select Case typ
+        Case "SS", "SF": base = Int(nStart(p))
+        Case Else:       base = Int(nFin(p))
+    End Select
+    Select Case typ
+        Case "FS", "SS": actual = nStart(v)
+        Case Else:       actual = nFin(v)
+    End Select
+    If actual = 0 Then Exit Function
+    actual = Int(actual)
+
+    If kind = LAG_PERCENT Then
+        If nFin(p) > nStart(p) Then durWD = DPWorkdaysBetween(Int(nStart(p)), Int(nFin(p))) + 1 Else durWD = 0
+        lag = lag / 100 * durWD
+        kind = LAG_WORKING
+    End If
+
+    If kind = LAG_ELAPSED Then
+        lagCD = CLng(Round(lag, 0))
+        Select Case typ
+            Case "FS":       imp = DPNextWorkday(base + lagCD)
+            Case "SS", "FF": imp = DPRollForward(base + lagCD)
+            Case "SF":       imp = DPAddWorkdays(DPRollForward(base + lagCD), -1)
+        End Select
+    Else
+        lagWD = CLng(Round(lag, 0))
+        Select Case typ
+            Case "FS":       imp = DPAddWorkdays(base, lagWD + 1)
+            Case "SS", "FF": imp = DPAddWorkdays(base, lagWD)
+            Case "SF":       imp = DPAddWorkdays(base, lagWD - 1)
+        End Select
+    End If
+
+    g = DPWorkdaysBetween(imp, actual)
+    DPEvalLink = True
+End Function
+
+'==============================================================================
+'  Calendar helpers (Mon-Fri)
+'==============================================================================
+Private Function DPIsWeekend(ByVal d As Double) As Boolean
+    DPIsWeekend = (Weekday(d, vbMonday) >= 6)
+End Function
+
+Private Function DPRollForward(ByVal d As Double) As Double
+    Do While DPIsWeekend(d): d = d + 1: Loop
+    DPRollForward = d
+End Function
+
+Private Function DPNextWorkday(ByVal d As Double) As Double
+    DPNextWorkday = DPRollForward(d + 1)
+End Function
+
+Private Function DPAddWorkdays(ByVal d As Double, ByVal n As Long) As Double
+    Dim i As Long
+    If n = 0 Then DPAddWorkdays = DPRollForward(d): Exit Function
+    If n > 0 Then
+        For i = 1 To n: d = DPNextWorkday(d): Next i
+    Else
+        For i = 1 To -n
+            d = d - 1
+            Do While DPIsWeekend(d): d = d - 1: Loop
+        Next i
+    End If
+    DPAddWorkdays = d
+End Function
+
+' Signed working days from a to b (same day = 0, Fri->Mon = 1)
+Private Function DPWorkdaysBetween(ByVal a As Double, ByVal b As Double) As Double
+    Dim lo As Double, hi As Double, d As Double, cnt As Long, fullWeeks As Long, sg As Long
+    a = Int(a): b = Int(b)
+    If a = b Then DPWorkdaysBetween = 0: Exit Function
+    If b > a Then lo = a: hi = b: sg = 1 Else lo = b: hi = a: sg = -1
+    fullWeeks = Int((hi - lo) / 7)
+    cnt = fullWeeks * 5
+    d = lo + fullWeeks * 7
+    Do While d < hi
+        d = d + 1
+        If Not DPIsWeekend(d) Then cnt = cnt + 1
+    Loop
+    DPWorkdaysBetween = sg * cnt
+End Function
+
+'==============================================================================
+'  Graph storage
+'==============================================================================
+Private Sub DPInitGraph(ByVal n As Long)
+    ReDim mInHead(1 To n)
+    ReDim mInNext(1 To 1024): ReDim mInSrc(1 To 1024)
+    ReDim mLnkType(1 To 1024): ReDim mLnkLag(1 To 1024)
+    ReDim mLnkKind(1 To 1024): ReDim mLnkDesc(1 To 1024)
+    mEdgeCount = 0
+    Set mEdgeDict = CreateObject("Scripting.Dictionary")
+End Sub
+
+Private Sub DPAddInEdge(ByVal f As Long, ByVal t As Long, ByVal typ As String, _
+                        ByVal lag As Double, ByVal kind As Long, ByVal desc As String)
+    Dim k As String, ub As Long
+    If f = t Then Exit Sub
+    k = f & "|" & t
+    If mEdgeDict.Exists(k) Then Exit Sub
+    mEdgeDict.Add k, 1
+    mEdgeCount = mEdgeCount + 1
+    ub = UBound(mInSrc)
+    If mEdgeCount > ub Then
+        ReDim Preserve mInNext(1 To ub * 2): ReDim Preserve mInSrc(1 To ub * 2)
+        ReDim Preserve mLnkType(1 To ub * 2): ReDim Preserve mLnkLag(1 To ub * 2)
+        ReDim Preserve mLnkKind(1 To ub * 2): ReDim Preserve mLnkDesc(1 To ub * 2)
+    End If
+    mInSrc(mEdgeCount) = f
+    mLnkType(mEdgeCount) = typ
+    mLnkLag(mEdgeCount) = lag
+    mLnkKind(mEdgeCount) = kind
+    mLnkDesc(mEdgeCount) = desc
+    mInNext(mEdgeCount) = mInHead(t)
+    mInHead(t) = mEdgeCount
+End Sub
+
+'==============================================================================
+'  Link parsing
+'  "27"  "27FS+2 days"  "27SS-1 wk"  "27FF+50%"  "27SF+3 edays"
+'  "<>\CUI_Prog_Proj_IMS\27FS+2 days"   "<>/CUI_Prog_Proj_IMS/27"
+'  "<>\\server\share\CUI_Prog_Proj_IMS.mpp\27SS"
+'==============================================================================
+Private Function DPSplitLinks(ByVal txt As String) As Variant
+    txt = Trim$(txt)
+    If Len(txt) = 0 Then
+        DPSplitLinks = Split("")                     ' empty array (UBound = -1)
+    ElseIf InStr(txt, ";") > 0 Then
+        DPSplitLinks = Split(txt, ";")               ' regional list separator
+    Else
+        DPSplitLinks = Split(txt, ",")
+    End If
+End Function
+
+Private Function DPParseLink(ByVal item As String, ByVal curProjKey As String, _
+                             ByRef outProjKey As String, ByRef outID As Long, _
+                             ByRef outType As String, ByRef outLag As Double, _
+                             ByRef outKind As Long, ByRef outDesc As String) As Boolean
+    Dim s As String, p As Long, projPart As String, idPart As String, restPart As String
+    Dim i As Long, ch As String, numTxt As String, unitTxt As String, sgnV As Double, lagStr As String
+
+    DPParseLink = False
+    s = Trim$(item)
+    If Len(s) = 0 Then Exit Function
+    s = Replace(s, "/", "\")
+
+    If Left$(s, 2) = "<>" Then
+        s = Mid$(s, 3)
+        Do While Left$(s, 1) = "\": s = Mid$(s, 2): Loop
+    End If
+
+    p = InStrRev(s, "\")
+    If p > 0 Then
+        projPart = Left$(s, p - 1): idPart = Mid$(s, p + 1)
+    Else
+        projPart = "": idPart = s
+    End If
+
+    If Len(projPart) > 0 Then
+        p = InStrRev(projPart, "\")
+        If p > 0 Then projPart = Mid$(projPart, p + 1)
+        If LCase$(Right$(projPart, 4)) = ".mpp" Then projPart = Left$(projPart, Len(projPart) - 4)
+        outProjKey = UCase$(Trim$(projPart))
+    Else
+        outProjKey = curProjKey
+    End If
+
+    ' ID = leading digits
+    idPart = Trim$(idPart)
+    numTxt = ""
+    For i = 1 To Len(idPart)
+        ch = Mid$(idPart, i, 1)
+        If ch Like "#" Then numTxt = numTxt & ch Else Exit For
+    Next i
+    If Len(numTxt) = 0 Then Exit Function
+    outID = CLng(numTxt)
+    restPart = Trim$(Mid$(idPart, Len(numTxt) + 1))
+
+    ' Type
+    outType = "FS": outLag = 0: outKind = LAG_WORKING
+    If Len(restPart) >= 2 Then
+        Select Case UCase$(Left$(restPart, 2))
+            Case "FS", "SS", "FF", "SF"
+                outType = UCase$(Left$(restPart, 2))
+                restPart = Trim$(Mid$(restPart, 3))
+        End Select
+    End If
+    lagStr = restPart
+    outDesc = outType & IIf(Len(lagStr) > 0, " " & lagStr, "")
+    If Len(restPart) = 0 Then DPParseLink = True: Exit Function
+
+    ' Lag
+    sgnV = 1
+    If Left$(restPart, 1) = "-" Then
+        sgnV = -1: restPart = Trim$(Mid$(restPart, 2))
+    ElseIf Left$(restPart, 1) = "+" Then
+        restPart = Trim$(Mid$(restPart, 2))
+    End If
+    numTxt = ""
+    For i = 1 To Len(restPart)
+        ch = Mid$(restPart, i, 1)
+        If ch Like "#" Or ch = "." Or ch = "," Then
+            numTxt = numTxt & IIf(ch = ",", ".", ch)
+        Else
+            Exit For
+        End If
+    Next i
+    If Len(numTxt) = 0 Then DPParseLink = True: Exit Function   ' unrecognised text -> no lag
+    unitTxt = LCase$(Trim$(Mid$(restPart, Len(numTxt) + 1)))
+    outLag = sgnV * Val(numTxt)
+
+    If Left$(unitTxt, 1) = "%" Then
+        outKind = LAG_PERCENT
+    ElseIf Left$(unitTxt, 1) = "e" And Len(unitTxt) > 1 Then
+        outKind = LAG_ELAPSED
+        outLag = outLag * DPUnitToDays(Mid$(unitTxt, 2), True)
+    Else
+        outKind = LAG_WORKING
+        outLag = outLag * DPUnitToDays(unitTxt, False)
+    End If
+    DPParseLink = True
+End Function
+
+Private Function DPUnitToDays(ByVal u As String, ByVal elapsed As Boolean) As Double
+    u = Trim$(u)
+    If Len(u) = 0 Then DPUnitToDays = 1: Exit Function
+    Select Case True
+        Case Left$(u, 2) = "mo": DPUnitToDays = IIf(elapsed, 30, 20)          ' months
+        Case Left$(u, 1) = "m":  DPUnitToDays = IIf(elapsed, 1 / 1440, 1 / 480) ' minutes
+        Case Left$(u, 1) = "h":  DPUnitToDays = IIf(elapsed, 1 / 24, 1 / 8)     ' hours
+        Case Left$(u, 1) = "w":  DPUnitToDays = IIf(elapsed, 7, 5)            ' weeks
+        Case Else:               DPUnitToDays = 1                              ' days
+    End Select
+End Function
+
+' Match a project name from a link to a value in the Project column.
+' Exact (case-insensitive) first; then suffix match either direction.
+Private Function DPResolveProject(ByVal projKey As String, ByVal projDict As Object, ByVal cache As Object) As String
+    Dim k As Variant
+    If cache.Exists(projKey) Then DPResolveProject = cache(projKey): Exit Function
+    If projDict.Exists(projKey) Then
+        DPResolveProject = projKey
+    Else
+        DPResolveProject = ""
+        For Each k In projDict.Keys
+            If Len(k) > 0 Then
+                If Right$(k, Len(projKey)) = projKey Or _
+                   (Len(projKey) >= Len(k) And Right$(projKey, Len(k)) = k) Then
+                    DPResolveProject = k
+                    Exit For
+                End If
+            End If
+        Next k
+    End If
+    cache.Add projKey, DPResolveProject
+End Function
+
+'==============================================================================
+'  Misc helpers
+'==============================================================================
+Private Function DPBefore(ByVal a As Long, ByVal b As Long, ByRef nStart() As Double, _
+                          ByRef nFin() As Double, ByRef lvl() As Long) As Boolean
+    If nStart(a) <> nStart(b) Then DPBefore = (nStart(a) < nStart(b)): Exit Function
+    If nFin(a) <> nFin(b) Then DPBefore = (nFin(a) < nFin(b)): Exit Function
+    DPBefore = (lvl(a) > lvl(b))
+End Function
+
+Private Function DPLabel(ByVal v As Long) As String
+    DPLabel = mProjDisp(v) & "\" & mID(v)
+End Function
+
+Private Function DPSafeStr(ByVal x As Variant) As String
+    If IsError(x) Then DPSafeStr = "" Else DPSafeStr = CStr(x & "")
+End Function
+
+Private Function DPDateVal(ByVal x As Variant) As Double
+    On Error Resume Next
+    DPDateVal = 0
+    If IsError(x) Then Exit Function
+    If IsEmpty(x) Then Exit Function
+    If VarType(x) = vbDate Then DPDateVal = CDbl(x): Exit Function
+    If IsDate(x) Then
+        DPDateVal = CDbl(CDate(x))
+    ElseIf IsNumeric(x) Then
+        If CDbl(x) > 10000 Then DPDateVal = CDbl(x)
+    End If
+End Function
+
+Private Function DPFindHeaderRow(ws As Worksheet) As Long
+    Dim r As Long, c As Long, lastC As Long, hasID As Boolean, hasPred As Boolean, t As String
+    For r = 1 To 20
+        lastC = ws.Cells(r, ws.Columns.Count).End(xlToLeft).Column
+        hasID = False: hasPred = False
+        For c = 1 To lastC
+            t = UCase$(Trim$(DPSafeStr(ws.Cells(r, c).Value)))
+            If t = "ID" Then hasID = True
+            If t = "PREDECESSORS" Then hasPred = True
+        Next c
+        If hasID And hasPred Then DPFindHeaderRow = r: Exit Function
+    Next r
+    DPFindHeaderRow = 0
+End Function
+
+Private Function DPFindCol(ws As Worksheet, ByVal hdrRow As Long, ByVal lastCol As Long, ByVal nm As String) As Long
+    Dim c As Long
+    For c = 1 To lastCol
+        If UCase$(Trim$(DPSafeStr(ws.Cells(hdrRow, c).Value))) = UCase$(nm) Then DPFindCol = c: Exit Function
+    Next c
+    DPFindCol = 0
+End Function
+
+Private Function DPSheetExists(wb As Workbook, ByVal nm As String) As Boolean
+    Dim ws As Worksheet
+    On Error Resume Next
+    Set ws = wb.Worksheets(nm)
+    On Error GoTo 0
+    DPSheetExists = Not ws Is Nothing
+End Function
+
+Private Function DPSafeSheetName(ByVal nm As String) As String
+    Dim bad As Variant, i As Long
+    bad = Array(":", "\", "/", "?", "*", "[", "]", "'")
+    For i = LBound(bad) To UBound(bad)
+        nm = Replace(nm, bad(i), "_")
+    Next i
+    nm = Trim$(nm)
+    If Len(nm) > 31 Then nm = Left$(nm, 31)
+    DPSafeSheetName = nm
+End Function
