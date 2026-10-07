@@ -1,601 +1,688 @@
 Option Explicit
 
-'==========================================================================
-'  Circular Logic Finder for MS Project Excel exports
-'  Required columns: Unique ID, PUID, Name, Start, Finish, Total Slack,
-'  Free Slack, Unique ID Predecessors, Unique ID Successors, CAM
-'==========================================================================
+'==============================================================================
+'  CIRCULAR LOGIC FINDER – MS Project Master/Subproject export
+'
+'  * Reads the active sheet (header row auto-detected) into arrays.
+'  * Builds a directed graph:  Predecessor -> Task  and  Task -> Successor
+'  * Local links  : "27FS+2 days"               -> same Project as the row
+'  * External     : "<>\CUI_Prog_Proj_IMS\27FS" -> Project column = CUI_Prog_Proj_IMS
+'  * Finds every strongly-connected component (SCC) with >1 task, or a task
+'    that links to itself  ==> circular logic.
+'  * One new tab per loop, named for the PUID of the first task in the chain
+'    (first = lowest row in the export). Tab contains:
+'       Section 1: ordered loop path (start -> ... -> back to start)
+'       Section 2: every task that participates in that circular cluster,
+'                  with its in-loop predecessors / successors
+'  * A summary tab lists all loops + any links that could not be resolved.
+'  * No clipboard usage anywhere.
+'==============================================================================
 
-Private Const MARKER As String = "CIRCULAR LOGIC PATH"
-Private Const SUMMARY_NAME As String = "Circular Logic Summary"
+Private Const SUMMARY_SHEET As String = "Circular Logic Summary"
+Private Const MAX_UNRESOLVED_LISTED As Long = 1000
 
-' Graph storage (module level so the helper routines can share it)
-Private nNodes As Long
-Private adjStart() As Long
-Private adjTo() As Long
-Private compId() As Long
-Private seen() As Boolean
-Private stampArr() As Long
-Private parentArr() As Long
-Private queueArr() As Long
-Private stampVal As Long
+' ---- Graph storage (adjacency as linked lists in arrays) --------------------
+Private mHead() As Long         ' mHead(node)  = first edge index (0 = none)
+Private mNext() As Long         ' mNext(edge)  = next edge index for same source
+Private mTgt() As Long          ' mTgt(edge)   = target node
+Private mEdgeCount As Long
+Private mSelfLoop() As Boolean
+Private mEdgeDict As Object     ' dedupe "from|to"
 
+'==============================================================================
 Public Sub FindCircularLogic()
 
-    Dim wb As Workbook, wsSrc As Worksheet, wsOut As Worksheet, wsSum As Worksheet
+    Dim wb As Workbook, wsSrc As Worksheet
     Dim hdrRow As Long, lastRow As Long, lastCol As Long
-    Dim cUID As Long, cPUID As Long, cName As Long, cStart As Long, cFinish As Long
-    Dim cTS As Long, cFS As Long, cPred As Long, cSucc As Long, cCAM As Long
-    Dim data As Variant, hdr As Variant
-    Dim i As Long, j As Long, r As Long, c As Long, k As Long, g As Long
-    Dim calcMode As XlCalculation
-    Dim missing As String
+    Dim cID As Long, cProj As Long, cPUID As Long, cName As Long, cPred As Long, cSucc As Long
+    Dim data As Variant, hdrs As Variant
+    Dim nRows As Long, r As Long, c As Long, n As Long, v As Long, w As Long, e As Long, i As Long
+    Dim taskIdx As Object, projDict As Object, resolveCache As Object
+    Dim nodeRow() As Long, nodeProjKey() As String, nodeProjDisp() As String, nodeID() As Long
+    Dim unresolved As Collection, dupCount As Long
+    Dim t0 As Single
 
+    Dim prevScreen As Boolean, prevEvents As Boolean, prevCalc As XlCalculation
+
+    t0 = Timer
+    Set wb = ActiveWorkbook
     Set wsSrc = ActiveSheet
-    Set wb = wsSrc.Parent
 
-    '---------------- Locate header row ----------------
-    For r = 1 To 20
-        lastCol = wsSrc.Cells(r, wsSrc.Columns.Count).End(xlToLeft).Column
-        For c = 1 To lastCol
-            If LCase$(Trim$(wsSrc.Cells(r, c).Text)) = "unique id" Then
-                hdrRow = r
-                Exit For
-            End If
-        Next c
-        If hdrRow > 0 Then Exit For
-    Next r
-
+    '--------------------------------------------------------------------------
+    ' 1. Locate header row and required columns
+    '--------------------------------------------------------------------------
+    hdrRow = FindHeaderRow(wsSrc)
     If hdrRow = 0 Then
-        MsgBox "Could not find a 'Unique ID' header in the first 20 rows of '" & _
-               wsSrc.Name & "'.", vbExclamation
-        Exit Sub
-    End If
-    If lastCol < 2 Then
-        MsgBox "Header row does not contain the required columns.", vbExclamation
+        MsgBox "Could not find a header row containing 'ID' and 'Predecessors' on sheet '" & _
+               wsSrc.Name & "'. Make the export sheet active and try again.", vbExclamation
         Exit Sub
     End If
 
-    hdr = wsSrc.Range(wsSrc.Cells(hdrRow, 1), wsSrc.Cells(hdrRow, lastCol)).Value
+    lastCol = wsSrc.Cells(hdrRow, wsSrc.Columns.Count).End(xlToLeft).Column
+    cID = FindCol(wsSrc, hdrRow, lastCol, "ID")
+    cProj = FindCol(wsSrc, hdrRow, lastCol, "Project")
+    cPUID = FindCol(wsSrc, hdrRow, lastCol, "PUID")
+    cName = FindCol(wsSrc, hdrRow, lastCol, "Name")
+    cPred = FindCol(wsSrc, hdrRow, lastCol, "Predecessors")
+    cSucc = FindCol(wsSrc, hdrRow, lastCol, "Successors")
 
-    cUID = GetCol(hdr, "Unique ID"):                If cUID = 0 Then missing = missing & vbCrLf & "Unique ID"
-    cPUID = GetCol(hdr, "PUID"):                    If cPUID = 0 Then missing = missing & vbCrLf & "PUID"
-    cName = GetCol(hdr, "Name"):                    If cName = 0 Then missing = missing & vbCrLf & "Name"
-    cStart = GetCol(hdr, "Start"):                  If cStart = 0 Then missing = missing & vbCrLf & "Start"
-    cFinish = GetCol(hdr, "Finish"):                If cFinish = 0 Then missing = missing & vbCrLf & "Finish"
-    cTS = GetCol(hdr, "Total Slack"):               If cTS = 0 Then missing = missing & vbCrLf & "Total Slack"
-    cFS = GetCol(hdr, "Free Slack"):                If cFS = 0 Then missing = missing & vbCrLf & "Free Slack"
-    cPred = GetCol(hdr, "Unique ID Predecessors"):  If cPred = 0 Then missing = missing & vbCrLf & "Unique ID Predecessors"
-    cSucc = GetCol(hdr, "Unique ID Successors"):    If cSucc = 0 Then missing = missing & vbCrLf & "Unique ID Successors"
-    cCAM = GetCol(hdr, "CAM"):                      If cCAM = 0 Then missing = missing & vbCrLf & "CAM"
-
-    If Len(missing) > 0 Then
-        MsgBox "The following required columns were not found:" & missing, vbExclamation
+    If cID = 0 Or cProj = 0 Or cPUID = 0 Or cPred = 0 Or cSucc = 0 Then
+        MsgBox "Missing one or more required columns (ID, Project, PUID, Predecessors, Successors).", vbExclamation
         Exit Sub
     End If
 
-    lastRow = wsSrc.Cells(wsSrc.Rows.Count, cUID).End(xlUp).Row
+    lastRow = wsSrc.Cells(wsSrc.Rows.Count, cID).End(xlUp).Row
     If lastRow <= hdrRow Then
-        MsgBox "No task rows found below the header.", vbExclamation
+        MsgBox "No data rows found below the header.", vbInformation
         Exit Sub
     End If
 
-    '---------------- App settings for speed ----------------
-    calcMode = Application.Calculation
+    prevScreen = Application.ScreenUpdating
+    prevEvents = Application.EnableEvents
+    prevCalc = Application.Calculation
     Application.ScreenUpdating = False
     Application.EnableEvents = False
     Application.Calculation = xlCalculationManual
+    Application.StatusBar = "Circular logic: reading data..."
+
     On Error GoTo CleanFail
 
-    Application.StatusBar = "Reading data..."
+    '--------------------------------------------------------------------------
+    ' 2. Pull everything into arrays (no clipboard)
+    '--------------------------------------------------------------------------
     data = wsSrc.Range(wsSrc.Cells(hdrRow + 1, 1), wsSrc.Cells(lastRow, lastCol)).Value
-    nNodes = UBound(data, 1)
+    hdrs = wsSrc.Range(wsSrc.Cells(hdrRow, 1), wsSrc.Cells(hdrRow, lastCol)).Value
+    nRows = UBound(data, 1)
 
-    '---------------- Map Unique ID -> row index ----------------
-    Dim uidOf() As Long
-    Dim uidMap As Object
-    ReDim uidOf(1 To nNodes)
-    Set uidMap = CreateObject("Scripting.Dictionary")
+    '--------------------------------------------------------------------------
+    ' 3. Build node table:  key = UCASE(Project) & "\" & ID
+    '--------------------------------------------------------------------------
+    Set taskIdx = CreateObject("Scripting.Dictionary"): taskIdx.CompareMode = vbTextCompare
+    Set projDict = CreateObject("Scripting.Dictionary"): projDict.CompareMode = vbTextCompare
+    Set resolveCache = CreateObject("Scripting.Dictionary"): resolveCache.CompareMode = vbTextCompare
+    Set unresolved = New Collection
 
-    For i = 1 To nNodes
-        uidOf(i) = -1
-        If Not IsError(data(i, cUID)) Then
-            If Len(Trim$(CStr(data(i, cUID)))) > 0 And IsNumeric(data(i, cUID)) Then
-                uidOf(i) = CLng(data(i, cUID))
-                If Not uidMap.Exists(uidOf(i)) Then uidMap.Add uidOf(i), i
+    ReDim nodeRow(1 To nRows)
+    ReDim nodeProjKey(1 To nRows)
+    ReDim nodeProjDisp(1 To nRows)
+    ReDim nodeID(1 To nRows)
+
+    Dim sID As String, sProj As String, key As String, idVal As Long
+    n = 0
+    For r = 1 To nRows
+        sID = Trim$(SafeStr(data(r, cID)))
+        If Len(sID) > 0 And IsNumeric(sID) Then
+            idVal = CLng(Val(sID))
+            sProj = Trim$(SafeStr(data(r, cProj)))
+            key = UCase$(sProj) & "\" & CStr(idVal)
+            If Not taskIdx.Exists(key) Then
+                n = n + 1
+                taskIdx.Add key, n
+                nodeRow(n) = r
+                nodeProjKey(n) = UCase$(sProj)
+                nodeProjDisp(n) = sProj
+                nodeID(n) = idVal
+                If Not projDict.Exists(UCase$(sProj)) Then projDict.Add UCase$(sProj), sProj
+            Else
+                dupCount = dupCount + 1
             End If
         End If
-    Next i
+    Next r
 
-    '---------------- Build edge list from Pred & Succ fields ----------------
-    Application.StatusBar = "Parsing logic links..."
-    Dim edges As Object
-    Dim selfLoop() As Boolean
-    Dim toks As Variant, t As Long, lnkUID As Long, rel As String, other As Long
-
-    Set edges = CreateObject("Scripting.Dictionary")
-    ReDim selfLoop(1 To nNodes)
-
-    For i = 1 To nNodes
-        If uidOf(i) >= 0 Then
-            ' Predecessors: edge pred -> this task
-            toks = SplitLinks(CellText(data(i, cPred)))
-            For t = LBound(toks) To UBound(toks)
-                If ParseLink(CStr(toks(t)), lnkUID, rel) Then
-                    If uidMap.Exists(lnkUID) Then
-                        other = uidMap(lnkUID)
-                        AddEdge edges, other, i, rel, selfLoop
-                    End If
-                End If
-            Next t
-            ' Successors: edge this task -> succ
-            toks = SplitLinks(CellText(data(i, cSucc)))
-            For t = LBound(toks) To UBound(toks)
-                If ParseLink(CStr(toks(t)), lnkUID, rel) Then
-                    If uidMap.Exists(lnkUID) Then
-                        other = uidMap(lnkUID)
-                        AddEdge edges, i, other, rel, selfLoop
-                    End If
-                End If
-            Next t
-        End If
-    Next i
-
-    Dim m As Long
-    m = edges.Count
-    If m = 0 Then
-        MsgBox "No predecessor/successor links were found.", vbInformation
+    If n = 0 Then
+        MsgBox "No rows with a numeric ID were found.", vbInformation
         GoTo CleanExit
     End If
 
-    '---------------- Build compact adjacency (CSR) ----------------
-    Dim keys As Variant, eFrom() As Long, eTo() As Long, deg() As Long, fillPos() As Long
-    Dim p As Long
+    '--------------------------------------------------------------------------
+    ' 4. Build edges from Predecessors (pred -> task) and Successors (task -> succ)
+    '--------------------------------------------------------------------------
+    Application.StatusBar = "Circular logic: building dependency graph..."
+    InitGraph n
 
-    keys = edges.keys
-    ReDim eFrom(1 To m): ReDim eTo(1 To m)
-    For j = 0 To m - 1
-        p = InStr(keys(j), "|")
-        eFrom(j + 1) = CLng(Left$(keys(j), p - 1))
-        eTo(j + 1) = CLng(Mid$(keys(j), p + 1))
-    Next j
+    Dim items As Variant, k As Long, linkProj As String, linkID As Long, resolvedProj As String
+    Dim linkTxt As String
 
-    ReDim deg(1 To nNodes)
-    For j = 1 To m
-        deg(eFrom(j)) = deg(eFrom(j)) + 1
-    Next j
+    For v = 1 To n
+        r = nodeRow(v)
 
-    ReDim adjStart(1 To nNodes + 1)
-    adjStart(1) = 1
-    For i = 1 To nNodes
-        adjStart(i + 1) = adjStart(i) + deg(i)
-    Next i
+        ' --- Predecessors
+        linkTxt = SafeStr(data(r, cPred))
+        If Len(Trim$(linkTxt)) > 0 Then
+            items = Split(Replace(linkTxt, ";", ","), ",")
+            For k = LBound(items) To UBound(items)
+                If ParseLink(items(k), nodeProjKey(v), linkProj, linkID) Then
+                    resolvedProj = ResolveProject(linkProj, projDict, resolveCache)
+                    key = resolvedProj & "\" & CStr(linkID)
+                    If Len(resolvedProj) > 0 And taskIdx.Exists(key) Then
+                        AddEdge taskIdx(key), v
+                    Else
+                        LogUnresolved unresolved, r + hdrRow, "Predecessor", Trim$(items(k)), nodeProjDisp(v), nodeID(v)
+                    End If
+                End If
+            Next k
+        End If
 
-    ReDim fillPos(1 To nNodes)
-    For i = 1 To nNodes
-        fillPos(i) = adjStart(i)
-    Next i
+        ' --- Successors
+        linkTxt = SafeStr(data(r, cSucc))
+        If Len(Trim$(linkTxt)) > 0 Then
+            items = Split(Replace(linkTxt, ";", ","), ",")
+            For k = LBound(items) To UBound(items)
+                If ParseLink(items(k), nodeProjKey(v), linkProj, linkID) Then
+                    resolvedProj = ResolveProject(linkProj, projDict, resolveCache)
+                    key = resolvedProj & "\" & CStr(linkID)
+                    If Len(resolvedProj) > 0 And taskIdx.Exists(key) Then
+                        AddEdge v, taskIdx(key)
+                    Else
+                        LogUnresolved unresolved, r + hdrRow, "Successor", Trim$(items(k)), nodeProjDisp(v), nodeID(v)
+                    End If
+                End If
+            Next k
+        End If
+    Next v
 
-    ReDim adjTo(1 To m)
-    For j = 1 To m
-        adjTo(fillPos(eFrom(j))) = eTo(j)
-        fillPos(eFrom(j)) = fillPos(eFrom(j)) + 1
-    Next j
+    '--------------------------------------------------------------------------
+    ' 5. Tarjan SCC (iterative – safe for large graphs)
+    '--------------------------------------------------------------------------
+    Application.StatusBar = "Circular logic: searching for loops..."
 
-    '---------------- Tarjan SCC (iterative - no recursion) ----------------
-    Application.StatusBar = "Detecting circular logic..."
-    Dim idxArr() As Long, lowArr() As Long, onStk() As Boolean
-    Dim stk() As Long, cs() As Long, nextE() As Long
-    Dim sp As Long, csp As Long, counter As Long, compCount As Long
-    Dim s As Long, v As Long, w As Long, u As Long
+    Dim idx() As Long, low() As Long, onStk() As Boolean, comp() As Long, ptr() As Long
+    Dim tStk() As Long, tTop As Long, cStk() As Long, cTop As Long
+    Dim counter As Long, nComp As Long, compSize() As Long, u As Long, s As Long
 
-    ReDim idxArr(1 To nNodes): ReDim lowArr(1 To nNodes): ReDim onStk(1 To nNodes)
-    ReDim stk(1 To nNodes): ReDim cs(1 To nNodes): ReDim nextE(1 To nNodes)
-    ReDim compId(1 To nNodes)
+    ReDim idx(1 To n): ReDim low(1 To n): ReDim onStk(1 To n): ReDim comp(1 To n): ReDim ptr(1 To n)
+    ReDim tStk(1 To n): ReDim cStk(1 To n): ReDim compSize(1 To n)
 
-    For s = 1 To nNodes
-        If idxArr(s) = 0 Then
-            counter = counter + 1
-            idxArr(s) = counter: lowArr(s) = counter
-            sp = sp + 1: stk(sp) = s: onStk(s) = True
-            nextE(s) = adjStart(s)
-            csp = 1: cs(1) = s
-
-            Do While csp > 0
-                v = cs(csp)
-                If nextE(v) < adjStart(v + 1) Then
-                    w = adjTo(nextE(v))
-                    nextE(v) = nextE(v) + 1
-                    If idxArr(w) = 0 Then
-                        counter = counter + 1
-                        idxArr(w) = counter: lowArr(w) = counter
-                        sp = sp + 1: stk(sp) = w: onStk(w) = True
-                        nextE(w) = adjStart(w)
-                        csp = csp + 1: cs(csp) = w
+    counter = 0: nComp = 0
+    For s = 1 To n
+        If idx(s) = 0 Then
+            counter = counter + 1: idx(s) = counter: low(s) = counter
+            tTop = tTop + 1: tStk(tTop) = s: onStk(s) = True
+            cTop = cTop + 1: cStk(cTop) = s
+            ptr(s) = mHead(s)
+            Do While cTop > 0
+                v = cStk(cTop)
+                If ptr(v) <> 0 Then
+                    e = ptr(v): ptr(v) = mNext(e): w = mTgt(e)
+                    If idx(w) = 0 Then
+                        counter = counter + 1: idx(w) = counter: low(w) = counter
+                        tTop = tTop + 1: tStk(tTop) = w: onStk(w) = True
+                        cTop = cTop + 1: cStk(cTop) = w
+                        ptr(w) = mHead(w)
                     ElseIf onStk(w) Then
-                        If idxArr(w) < lowArr(v) Then lowArr(v) = idxArr(w)
+                        If idx(w) < low(v) Then low(v) = idx(w)
                     End If
                 Else
-                    If lowArr(v) = idxArr(v) Then
-                        compCount = compCount + 1
+                    cTop = cTop - 1
+                    If low(v) = idx(v) Then
+                        nComp = nComp + 1
                         Do
-                            w = stk(sp): sp = sp - 1
-                            onStk(w) = False
-                            compId(w) = compCount
+                            w = tStk(tTop): tTop = tTop - 1: onStk(w) = False
+                            comp(w) = nComp: compSize(nComp) = compSize(nComp) + 1
                         Loop Until w = v
                     End If
-                    csp = csp - 1
-                    If csp > 0 Then
-                        u = cs(csp)
-                        If lowArr(v) < lowArr(u) Then lowArr(u) = lowArr(v)
+                    If cTop > 0 Then
+                        u = cStk(cTop)
+                        If low(v) < low(u) Then low(u) = low(v)
                     End If
                 End If
             Loop
         End If
     Next s
 
-    '---------------- Identify cyclic groups ----------------
-    Dim compSize() As Long, compSelf() As Boolean, compFirst() As Long
-    Dim groups() As Long, nGroups As Long
+    ' Group members by component (counting sort)
+    Dim compStart() As Long, fillPos() As Long, members() As Long
+    ReDim compStart(1 To nComp + 1): ReDim fillPos(1 To nComp + 1): ReDim members(1 To n)
+    compStart(1) = 1
+    For c = 1 To nComp: compStart(c + 1) = compStart(c) + compSize(c): Next c
+    For c = 1 To nComp + 1: fillPos(c) = compStart(c): Next c
+    For v = 1 To n
+        members(fillPos(comp(v))) = v
+        fillPos(comp(v)) = fillPos(comp(v)) + 1
+    Next v
 
-    ReDim compSize(1 To compCount): ReDim compSelf(1 To compCount): ReDim compFirst(1 To compCount)
-    For i = 1 To nNodes
-        c = compId(i)
-        compSize(c) = compSize(c) + 1
-        If selfLoop(i) Then compSelf(c) = True
-        If compFirst(c) = 0 Then compFirst(c) = i      ' first row in sheet order
-    Next i
-
-    ReDim groups(1 To compCount)
-    For i = 1 To nNodes
-        c = compId(i)
-        If compFirst(c) = i Then
-            If compSize(c) > 1 Or compSelf(c) Then
-                nGroups = nGroups + 1
-                groups(nGroups) = c
-            End If
+    ' Identify cyclic components and their "first task" (lowest export row)
+    Dim cycComp() As Long, cycFirst() As Long, nCyc As Long
+    ReDim cycComp(1 To nComp): ReDim cycFirst(1 To nComp)
+    For c = 1 To nComp
+        Dim isCyc As Boolean, firstV As Long
+        isCyc = (compSize(c) > 1)
+        If Not isCyc Then isCyc = mSelfLoop(members(compStart(c)))
+        If isCyc Then
+            firstV = members(compStart(c))
+            For i = compStart(c) To compStart(c + 1) - 1
+                If nodeRow(members(i)) < nodeRow(firstV) Then firstV = members(i)
+            Next i
+            nCyc = nCyc + 1
+            cycComp(nCyc) = c
+            cycFirst(nCyc) = firstV
         End If
-    Next i
+    Next c
 
-    If nGroups = 0 Then
-        MsgBox "No circular logic found in " & nNodes & " rows / " & m & " links.", vbInformation
-        GoTo CleanExit
-    End If
-
-    If nGroups > 100 Then
-        Application.ScreenUpdating = True
-        If MsgBox(nGroups & " circular logic groups were found. Create " & nGroups & _
-                  " tabs?", vbYesNo + vbQuestion) = vbNo Then GoTo CleanExit
-        Application.ScreenUpdating = False
-    End If
-
-    '---------------- Remove output from previous runs ----------------
-    Dim ws As Worksheet
-    Application.DisplayAlerts = False
-    For i = wb.Worksheets.Count To 1 Step -1
-        Set ws = wb.Worksheets(i)
-        If Not ws Is wsSrc Then
-            If ws.Name = SUMMARY_NAME Or ws.Range("A1").Text = MARKER Then ws.Delete
-        End If
-    Next i
-    Application.DisplayAlerts = True
-
-    ' Create the summary first so loop tabs can't take its name
-    Set wsSum = wb.Worksheets.Add(After:=wb.Sheets(wb.Sheets.Count))
-    wsSum.Name = SUMMARY_NAME
-
-    '---------------- Write one tab per loop group ----------------
-    ReDim seen(1 To nNodes): ReDim stampArr(1 To nNodes)
-    ReDim parentArr(1 To nNodes): ReDim queueArr(1 To nNodes)
-    stampVal = 0
-
-    Dim walk() As Long, wc As Long, nxt As Long
-    Dim outArr() As Variant, sumArr() As Variant, tabNames() As String
-    Dim visitedD As Object, nm As String, pathStr As String, baseNm As String
-
-    ReDim sumArr(1 To nGroups, 1 To 7)
-    ReDim tabNames(1 To nGroups)
-
-    For g = 1 To nGroups
-        Application.StatusBar = "Writing loop " & g & " of " & nGroups & "..."
-        c = groups(g)
-        s = compFirst(c)
-        walk = BuildWalk(s, c, compSize(c), wc)
-
-        ReDim outArr(1 To wc, 1 To 12)
-        Set visitedD = CreateObject("Scripting.Dictionary")
-        pathStr = ""
-
-        For j = 1 To wc
-            v = walk(j)
-            outArr(j, 1) = j
-            outArr(j, 2) = data(v, cUID)
-            outArr(j, 3) = data(v, cPUID)
-            outArr(j, 4) = data(v, cName)
-            outArr(j, 5) = data(v, cStart)
-            outArr(j, 6) = data(v, cFinish)
-            outArr(j, 7) = data(v, cTS)
-            outArr(j, 8) = data(v, cFS)
-            outArr(j, 9) = data(v, cCAM)
-            If j < wc Then
-                nxt = walk(j + 1)
-                outArr(j, 10) = edges(CStr(v) & "|" & CStr(nxt))
-                outArr(j, 11) = data(nxt, cUID)
-            End If
-            If j = wc Then
-                outArr(j, 12) = "Back to start - loop closes"
-            ElseIf visitedD.Exists(v) Then
-                outArr(j, 12) = "Revisit (task is in more than one loop)"
-            End If
-            visitedD(v) = True
-
-            If Len(pathStr) < 32000 Then
-                If j > 1 Then pathStr = pathStr & " > "
-                pathStr = pathStr & CStr(uidOf(v))
+    ' Sort cycles by first task's row so tabs follow export order
+    Dim j As Long, tmpL As Long
+    For i = 2 To nCyc
+        For j = i To 2 Step -1
+            If nodeRow(cycFirst(j)) < nodeRow(cycFirst(j - 1)) Then
+                tmpL = cycFirst(j): cycFirst(j) = cycFirst(j - 1): cycFirst(j - 1) = tmpL
+                tmpL = cycComp(j): cycComp(j) = cycComp(j - 1): cycComp(j - 1) = tmpL
+            Else
+                Exit For
             End If
         Next j
-        If Len(pathStr) >= 32000 Then pathStr = Left$(pathStr, 31990) & " ..."
+    Next i
 
-        baseNm = Trim$(CellText(data(s, cPUID)))
-        If Len(baseNm) = 0 Then baseNm = "UID " & uidOf(s)
-        nm = UniqueSheetName(wb, baseNm)
+    '--------------------------------------------------------------------------
+    ' 6. Output – summary sheet + one sheet per loop
+    '--------------------------------------------------------------------------
+    Application.StatusBar = "Circular logic: writing results..."
 
-        Set wsOut = wb.Worksheets.Add(After:=wb.Sheets(wb.Sheets.Count))
-        wsOut.Name = nm
-        tabNames(g) = nm
+    Dim wsSum As Worksheet
+    Set wsSum = GetFreshSheet(wb, SUMMARY_SHEET, wsSrc)
 
-        wsOut.Range("A1").Value = MARKER
-        wsOut.Range("A2").Value = "Group " & g & " of " & nGroups & _
-                                  "   |   Tasks in loop: " & compSize(c) & _
-                                  "   |   Path steps: " & (wc - 1) & _
-                                  "   |   Source sheet: " & wsSrc.Name
-        wsOut.Range("A4").Resize(1, 12).Value = Array("Step", "Unique ID", "PUID", "Name", _
-            "Start", "Finish", "Total Slack", "Free Slack", "CAM", _
-            "Link to Next (Type/Lag)", "Next Unique ID", "Note")
-        wsOut.Range("A5").Resize(wc, 12).Value = outArr
-        wsOut.Range("E5").Resize(wc, 1).NumberFormat = wsSrc.Cells(hdrRow + 1, cStart).NumberFormat
-        wsOut.Range("F5").Resize(wc, 1).NumberFormat = wsSrc.Cells(hdrRow + 1, cFinish).NumberFormat
-        wsOut.Range("A1").Font.Bold = True
-        wsOut.Range("A4").Resize(1, 12).Font.Bold = True
-        wsOut.Range("A4").Resize(1, 12).Interior.Color = RGB(221, 235, 247)
-        wsOut.Columns("A:L").AutoFit
+    Dim sumArr As Variant
+    ReDim sumArr(1 To nCyc + 1, 1 To 9)
+    sumArr(1, 1) = "Loop #": sumArr(1, 2) = "Tab Name": sumArr(1, 3) = "First Task PUID"
+    sumArr(1, 4) = "Project": sumArr(1, 5) = "ID": sumArr(1, 6) = "Name"
+    sumArr(1, 7) = "Tasks In Cluster": sumArr(1, 8) = "Loop Length": sumArr(1, 9) = "Loop Path"
 
-        sumArr(g, 1) = g
-        sumArr(g, 2) = nm
-        sumArr(g, 3) = data(s, cUID)
-        sumArr(g, 4) = data(s, cPUID)
-        sumArr(g, 5) = data(s, cName)
-        sumArr(g, 6) = compSize(c)
-        sumArr(g, 7) = pathStr
-    Next g
+    Dim mark() As Long, parent() As Long, queue() As Long, stamp As Long
+    ReDim mark(1 To n): ReDim parent(1 To n): ReDim queue(1 To n)
 
-    '---------------- Summary sheet ----------------
-    wsSum.Range("A1").Value = "Circular Logic Summary - " & nGroups & " loop group(s) found in '" & _
-                              wsSrc.Name & "' (" & nNodes & " rows, " & m & " links)"
-    wsSum.Range("A1").Font.Bold = True
-    wsSum.Range("A3").Resize(1, 7).Value = Array("Group", "Tab", "First Task UID", _
-        "First Task PUID", "First Task Name", "Tasks in Loop", "Loop Path (Unique IDs)")
-    wsSum.Range("A3").Resize(1, 7).Font.Bold = True
-    wsSum.Range("A3").Resize(1, 7).Interior.Color = RGB(221, 235, 247)
-    wsSum.Range("A4").Resize(nGroups, 7).Value = sumArr
+    Dim path() As Long, pathLen As Long, cc As Long, startV As Long, sheetName As String
+    Dim wsOut As Worksheet, pathTxt As String
+    Dim prevSheet As Worksheet
+    Set prevSheet = wsSum
 
-    For g = 1 To nGroups
-        wsSum.Hyperlinks.Add Anchor:=wsSum.Cells(3 + g, 2), Address:="", _
-            SubAddress:="'" & Replace(tabNames(g), "'", "''") & "'!A1", _
-            TextToDisplay:=tabNames(g)
-    Next g
-    wsSum.Columns("A:F").AutoFit
-    wsSum.Columns("G").ColumnWidth = 100
+    For i = 1 To nCyc
+        cc = cycComp(i)
+        startV = cycFirst(i)
 
-    Application.ScreenUpdating = True
-    wsSum.Activate
-    MsgBox nGroups & " circular logic group(s) found. See '" & SUMMARY_NAME & "'.", vbInformation
+        ' ---- find an ordered loop through the first task (BFS inside the SCC)
+        pathLen = 0
+        ReDim path(1 To compSize(cc) + 1)
+        If compSize(cc) = 1 Then
+            pathLen = 1: path(1) = startV
+        Else
+            stamp = stamp + 1
+            Dim qH As Long, qT As Long, found As Boolean, lastV As Long
+            qH = 1: qT = 0: found = False
+            e = mHead(startV)
+            Do While e <> 0
+                w = mTgt(e)
+                If comp(w) = cc And w <> startV And mark(w) <> stamp Then
+                    mark(w) = stamp: parent(w) = startV
+                    qT = qT + 1: queue(qT) = w
+                End If
+                e = mNext(e)
+            Loop
+            Do While qH <= qT And Not found
+                v = queue(qH): qH = qH + 1
+                e = mHead(v)
+                Do While e <> 0
+                    w = mTgt(e)
+                    If comp(w) = cc Then
+                        If w = startV Then
+                            found = True: lastV = v: Exit Do
+                        ElseIf mark(w) <> stamp Then
+                            mark(w) = stamp: parent(w) = v
+                            qT = qT + 1: queue(qT) = w
+                        End If
+                    End If
+                    e = mNext(e)
+                Loop
+            Loop
+            If found Then
+                ' reconstruct lastV -> ... -> startV, then reverse
+                Dim rev() As Long, rl As Long
+                ReDim rev(1 To compSize(cc) + 1)
+                v = lastV: rl = 0
+                Do
+                    rl = rl + 1: rev(rl) = v
+                    If v = startV Then Exit Do
+                    v = parent(v)
+                Loop
+                For k = rl To 1 Step -1
+                    pathLen = pathLen + 1: path(pathLen) = rev(k)
+                Next k
+            Else
+                pathLen = 1: path(1) = startV   ' should not happen inside an SCC
+            End If
+        End If
+
+        ' ---- create the tab
+        sheetName = SafeSheetName(wb, SafeStr(data(nodeRow(startV), cPUID)), nodeProjDisp(startV), nodeID(startV))
+        Set wsOut = wb.Worksheets.Add(After:=prevSheet)
+        wsOut.Name = sheetName
+        Set prevSheet = wsOut
+
+        ' Section 1: ordered loop path
+        Dim outArr As Variant, oc As Long, nextV As Long
+        oc = lastCol + 2
+        ReDim outArr(1 To pathLen + 1, 1 To oc)
+        outArr(1, 1) = "Step"
+        For c = 1 To lastCol: outArr(1, c + 1) = hdrs(1, c): Next c
+        outArr(1, oc) = "Next Task In Loop"
+        pathTxt = ""
+        For k = 1 To pathLen
+            v = path(k)
+            outArr(k + 1, 1) = k
+            For c = 1 To lastCol: outArr(k + 1, c + 1) = data(nodeRow(v), c): Next c
+            If k < pathLen Then nextV = path(k + 1) Else nextV = path(1)
+            outArr(k + 1, oc) = NodeLabel(nextV, nodeProjDisp, nodeID)
+            pathTxt = pathTxt & NodeLabel(v, nodeProjDisp, nodeID) & " -> "
+        Next k
+        pathTxt = pathTxt & NodeLabel(path(1), nodeProjDisp, nodeID)
+
+        With wsOut
+            .Cells(1, 1).Value = "CIRCULAR LOGIC PATH  (starts and ends at " & NodeLabel(startV, nodeProjDisp, nodeID) & _
+                                 ", PUID " & SafeStr(data(nodeRow(startV), cPUID)) & ")"
+            .Cells(1, 1).Font.Bold = True
+            .Cells(3, 1).Resize(pathLen + 1, oc).Value = outArr
+            .Cells(3, 1).Resize(1, oc).Font.Bold = True
+        End With
+
+        ' Section 2: every task in the cluster with in-loop preds/succs
+        Dim mCount As Long, mArr As Variant, predTxt As Object, succTxt As Object, lbl As String
+        mCount = compSize(cc)
+        Set predTxt = CreateObject("Scripting.Dictionary")
+        Set succTxt = CreateObject("Scripting.Dictionary")
+        For k = compStart(cc) To compStart(cc + 1) - 1
+            v = members(k)
+            e = mHead(v)
+            Do While e <> 0
+                w = mTgt(e)
+                If comp(w) = cc Then
+                    lbl = NodeLabel(w, nodeProjDisp, nodeID)
+                    succTxt(v) = succTxt(v) & IIf(Len(succTxt(v)) > 0, ", ", "") & lbl
+                    lbl = NodeLabel(v, nodeProjDisp, nodeID)
+                    predTxt(w) = predTxt(w) & IIf(Len(predTxt(w)) > 0, ", ", "") & lbl
+                End If
+                e = mNext(e)
+            Loop
+            If mSelfLoop(v) Then
+                lbl = NodeLabel(v, nodeProjDisp, nodeID) & " (self)"
+                succTxt(v) = succTxt(v) & IIf(Len(succTxt(v)) > 0, ", ", "") & lbl
+                predTxt(v) = predTxt(v) & IIf(Len(predTxt(v)) > 0, ", ", "") & lbl
+            End If
+        Next k
+
+        ReDim mArr(1 To mCount + 1, 1 To lastCol + 2)
+        For c = 1 To lastCol: mArr(1, c) = hdrs(1, c): Next c
+        mArr(1, lastCol + 1) = "In-Loop Predecessors"
+        mArr(1, lastCol + 2) = "In-Loop Successors"
+        j = 1
+        For k = compStart(cc) To compStart(cc + 1) - 1
+            v = members(k)
+            j = j + 1
+            For c = 1 To lastCol: mArr(j, c) = data(nodeRow(v), c): Next c
+            mArr(j, lastCol + 1) = SafeStr(predTxt(v))
+            mArr(j, lastCol + 2) = SafeStr(succTxt(v))
+        Next k
+
+        Dim sec2Row As Long
+        sec2Row = pathLen + 6
+        With wsOut
+            .Cells(sec2Row, 1).Value = "ALL TASKS IN THIS CIRCULAR LOGIC CLUSTER (" & mCount & " tasks)"
+            .Cells(sec2Row, 1).Font.Bold = True
+            .Cells(sec2Row + 1, 1).Resize(mCount + 1, lastCol + 2).Value = mArr
+            .Cells(sec2Row + 1, 1).Resize(1, lastCol + 2).Font.Bold = True
+            .Columns.AutoFit
+        End With
+
+        ' ---- summary row
+        sumArr(i + 1, 1) = i
+        sumArr(i + 1, 2) = sheetName
+        sumArr(i + 1, 3) = SafeStr(data(nodeRow(startV), cPUID))
+        sumArr(i + 1, 4) = nodeProjDisp(startV)
+        sumArr(i + 1, 5) = nodeID(startV)
+        If cName > 0 Then sumArr(i + 1, 6) = SafeStr(data(nodeRow(startV), cName))
+        sumArr(i + 1, 7) = mCount
+        sumArr(i + 1, 8) = pathLen
+        sumArr(i + 1, 9) = Left$(pathTxt, 32000)
+
+        If i Mod 10 = 0 Then Application.StatusBar = "Circular logic: writing loop " & i & " of " & nCyc
+    Next i
+
+    ' ---- finish summary sheet
+    With wsSum
+        .Cells(1, 1).Value = "Circular Logic Summary – source sheet '" & wsSrc.Name & "'"
+        .Cells(1, 1).Font.Bold = True
+        .Cells(2, 1).Value = "Tasks analysed: " & n & "   |   Links: " & mEdgeCount & _
+                             "   |   Loops found: " & nCyc & "   |   Duplicate Project\ID rows skipped: " & dupCount & _
+                             "   |   Unresolved links: " & unresolved.Count
+        .Cells(4, 1).Resize(nCyc + 1, 9).Value = sumArr
+        .Cells(4, 1).Resize(1, 9).Font.Bold = True
+
+        If unresolved.Count > 0 Then
+            Dim uArr As Variant, uRow As Long
+            uRow = nCyc + 7
+            .Cells(uRow, 1).Value = "Links that could not be matched to a row in the export (" & unresolved.Count & ")"
+            .Cells(uRow, 1).Font.Bold = True
+            ReDim uArr(1 To unresolved.Count + 1, 1 To 5)
+            uArr(1, 1) = "Source Row": uArr(1, 2) = "Project": uArr(1, 3) = "ID": uArr(1, 4) = "Field": uArr(1, 5) = "Link Text"
+            For k = 1 To unresolved.Count
+                items = Split(unresolved(k), vbTab)
+                For c = 0 To 4: uArr(k + 1, c + 1) = items(c): Next c
+            Next k
+            .Cells(uRow + 1, 1).Resize(unresolved.Count + 1, 5).Value = uArr
+            .Cells(uRow + 1, 1).Resize(1, 5).Font.Bold = True
+        End If
+        .Columns.AutoFit
+        .Columns(9).ColumnWidth = 80
+        .Activate
+    End With
+
+    Application.StatusBar = False
+    MsgBox "Done in " & Format(Timer - t0, "0.0") & " s." & vbCrLf & vbCrLf & _
+           "Tasks analysed: " & n & vbCrLf & _
+           "Dependency links: " & mEdgeCount & vbCrLf & _
+           "Circular logic loops found: " & nCyc & vbCrLf & _
+           "Unresolved links: " & unresolved.Count, vbInformation, "Circular Logic Finder"
 
 CleanExit:
     Application.StatusBar = False
-    Application.DisplayAlerts = True
-    Application.EnableEvents = True
-    Application.Calculation = calcMode
-    Application.ScreenUpdating = True
+    Application.ScreenUpdating = prevScreen
+    Application.EnableEvents = prevEvents
+    Application.Calculation = prevCalc
     Exit Sub
 
 CleanFail:
-    MsgBox "Error " & Err.Number & ": " & Err.Description, vbCritical
+    MsgBox "Error " & Err.Number & ": " & Err.Description, vbCritical, "Circular Logic Finder"
     Resume CleanExit
 End Sub
 
-'==========================================================================
-'  Builds a closed path that starts at s, visits every task in loop
-'  group c, and returns to s.  For a simple loop this is just the loop.
-'==========================================================================
-Private Function BuildWalk(ByVal s As Long, ByVal c As Long, ByVal size As Long, _
-                           ByRef wc As Long) As Long()
-    Dim walk() As Long, cap As Long, remaining As Long, cur As Long
-    Dim path() As Long, pc As Long, k As Long
+'==============================================================================
+'  Graph helpers
+'==============================================================================
+Private Sub InitGraph(ByVal n As Long)
+    ReDim mHead(1 To n)
+    ReDim mSelfLoop(1 To n)
+    ReDim mNext(1 To 1024)
+    ReDim mTgt(1 To 1024)
+    mEdgeCount = 0
+    Set mEdgeDict = CreateObject("Scripting.Dictionary")
+End Sub
 
-    cap = size * 2 + 2
-    ReDim walk(1 To cap)
-    wc = 1: walk(1) = s
-    seen(s) = True
-    remaining = size - 1
-    cur = s
-
-    ' Hop to the nearest unvisited task until all tasks in the group are covered
-    Do While remaining > 0
-        If Not BfsPath(cur, c, 0, path, pc) Then Exit Do
-        For k = 1 To pc
-            wc = wc + 1
-            If wc > cap Then cap = cap * 2: ReDim Preserve walk(1 To cap)
-            walk(wc) = path(k)
-            If Not seen(path(k)) Then
-                seen(path(k)) = True
-                remaining = remaining - 1
-            End If
-        Next k
-        cur = path(pc)
-    Loop
-
-    ' Close the loop back to the starting task
-    If cur = s Then
-        wc = wc + 1                                ' self-linked task
-        If wc > cap Then cap = cap + 1: ReDim Preserve walk(1 To cap)
-        walk(wc) = s
-    ElseIf BfsPath(cur, c, s, path, pc) Then
-        For k = 1 To pc
-            wc = wc + 1
-            If wc > cap Then cap = cap * 2: ReDim Preserve walk(1 To cap)
-            walk(wc) = path(k)
-        Next k
+Private Sub AddEdge(ByVal f As Long, ByVal t As Long)
+    Dim k As String
+    If f = t Then
+        mSelfLoop(f) = True
+        Exit Sub
     End If
+    k = f & "|" & t
+    If mEdgeDict.Exists(k) Then Exit Sub
+    mEdgeDict.Add k, 1
+    mEdgeCount = mEdgeCount + 1
+    If mEdgeCount > UBound(mTgt) Then
+        ReDim Preserve mTgt(1 To UBound(mTgt) * 2)
+        ReDim Preserve mNext(1 To UBound(mNext) * 2)
+    End If
+    mTgt(mEdgeCount) = t
+    mNext(mEdgeCount) = mHead(f)
+    mHead(f) = mEdgeCount
+End Sub
 
-    For k = 1 To wc                                ' reset for next group
-        seen(walk(k)) = False
-    Next k
+'==============================================================================
+'  Link parsing
+'  Handles:  "27"  "27FS+2 days"  "27SS-50%"
+'            "<>\CUI_Prog_Proj_IMS\27FS+3 days"
+'            "<>/CUI_Prog_Proj_IMS/27"   "<>\\server\share\CUI_Prog_Proj_IMS.mpp\27"
+'  Returns the UCASE project key (or the current row's key for local links)
+'==============================================================================
+Private Function ParseLink(ByVal item As String, ByVal curProjKey As String, _
+                           ByRef outProjKey As String, ByRef outID As Long) As Boolean
+    Dim s As String, p As Long, idPart As String, projPart As String
+    ParseLink = False
+    s = Trim$(item)
+    If Len(s) = 0 Then Exit Function
+    s = Replace(s, "/", "\")
 
-    ReDim Preserve walk(1 To wc)
-    BuildWalk = walk
-End Function
-
-'==========================================================================
-'  Breadth-first search inside loop group c.
-'  target > 0 : shortest path to that task
-'  target = 0 : shortest path to the nearest task not yet visited
-'  Returns the path excluding src, including the target.
-'==========================================================================
-Private Function BfsPath(ByVal src As Long, ByVal c As Long, ByVal target As Long, _
-                         ByRef path() As Long, ByRef pc As Long) As Boolean
-    Dim head As Long, tail As Long, v As Long, w As Long, e As Long
-    Dim found As Long, k As Long
-
-    stampVal = stampVal + 1
-    head = 1: tail = 1
-    queueArr(1) = src
-    stampArr(src) = stampVal
-
-    Do While head <= tail And found = 0
-        v = queueArr(head): head = head + 1
-        For e = adjStart(v) To adjStart(v + 1) - 1
-            w = adjTo(e)
-            If compId(w) = c Then
-                If stampArr(w) <> stampVal Then
-                    stampArr(w) = stampVal
-                    parentArr(w) = v
-                    tail = tail + 1: queueArr(tail) = w
-                    If target > 0 Then
-                        If w = target Then found = w: Exit For
-                    Else
-                        If Not seen(w) Then found = w: Exit For
-                    End If
-                End If
-            End If
-        Next e
-    Loop
-
-    If found = 0 Then Exit Function
-
-    pc = 0: w = found
-    Do While w <> src
-        pc = pc + 1: w = parentArr(w)
-    Loop
-    ReDim path(1 To pc)
-    k = pc: w = found
-    Do While w <> src
-        path(k) = w: k = k - 1: w = parentArr(w)
-    Loop
-    BfsPath = True
-End Function
-
-'==========================================================================
-'  Helpers
-'==========================================================================
-Private Function GetCol(hdr As Variant, ByVal colName As String) As Long
-    Dim c As Long
-    For c = LBound(hdr, 2) To UBound(hdr, 2)
-        If Not IsError(hdr(1, c)) Then
-            If StrComp(Trim$(CStr(hdr(1, c))), colName, vbTextCompare) = 0 Then
-                GetCol = c
-                Exit Function
-            End If
+    If Left$(s, 2) = "<>" Then
+        s = Mid$(s, 3)
+        Do While Left$(s, 1) = "\": s = Mid$(s, 2): Loop
+        p = InStrRev(s, "\")
+        If p = 0 Then Exit Function
+        projPart = Left$(s, p - 1)
+        idPart = Mid$(s, p + 1)
+    Else
+        p = InStrRev(s, "\")
+        If p > 0 Then
+            projPart = Left$(s, p - 1)
+            idPart = Mid$(s, p + 1)
+        Else
+            projPart = ""
+            idPart = s
         End If
-    Next c
-End Function
-
-Private Function CellText(v As Variant) As String
-    If IsError(v) Then
-        CellText = ""
-    ElseIf IsEmpty(v) Then
-        CellText = ""
-    Else
-        CellText = CStr(v)
     End If
-End Function
 
-Private Function SplitLinks(ByVal s As String) As Variant
-    s = Trim$(s)
-    If InStr(s, ";") > 0 Then
-        SplitLinks = Split(s, ";")      ' locales that use ; as list separator
+    If Len(projPart) > 0 Then
+        p = InStrRev(projPart, "\")
+        If p > 0 Then projPart = Mid$(projPart, p + 1)
+        If LCase$(Right$(projPart, 4)) = ".mpp" Then projPart = Left$(projPart, Len(projPart) - 4)
+        outProjKey = UCase$(Trim$(projPart))
     Else
-        SplitLinks = Split(s, ",")
+        outProjKey = curProjKey
     End If
-End Function
 
-' Parses tokens like "105", "105FS", "105SS+2 days", "105FF-1d"
-Private Function ParseLink(ByVal tok As String, ByRef uidOut As Long, _
-                           ByRef relOut As String) As Boolean
-    Dim j As Long, ch As Integer
-    tok = Trim$(tok)
-    If Len(tok) = 0 Then Exit Function
-    If InStr(tok, "\") > 0 Then Exit Function      ' external / cross-project link
-    j = 1
-    Do While j <= Len(tok)
-        ch = AscW(Mid$(tok, j, 1))
-        If ch < 48 Or ch > 57 Then Exit Do
-        j = j + 1
-    Loop
-    If j = 1 Or j - 1 > 9 Then Exit Function
-    uidOut = CLng(Left$(tok, j - 1))
-    relOut = Trim$(Mid$(tok, j))
-    If Len(relOut) = 0 Then relOut = "FS"
+    outID = LeadingNumber(idPart)
+    If outID < 0 Then Exit Function
     ParseLink = True
 End Function
 
-Private Sub AddEdge(edges As Object, ByVal a As Long, ByVal b As Long, _
-                    ByVal rel As String, selfLoop() As Boolean)
-    Dim key As String
-    key = CStr(a) & "|" & CStr(b)
-    If Not edges.Exists(key) Then edges.Add key, rel
-    If a = b Then selfLoop(a) = True
+' Returns leading integer in a string, or -1 if none
+Private Function LeadingNumber(ByVal s As String) As Long
+    Dim i As Long, d As String
+    s = Trim$(s)
+    For i = 1 To Len(s)
+        If Mid$(s, i, 1) Like "#" Then
+            d = d & Mid$(s, i, 1)
+        Else
+            Exit For
+        End If
+    Next i
+    If Len(d) = 0 Then LeadingNumber = -1 Else LeadingNumber = CLng(d)
+End Function
+
+' Match a project name from a link to a value in the Project column.
+' Exact (case-insensitive) first; then suffix matches either direction.
+Private Function ResolveProject(ByVal projKey As String, ByVal projDict As Object, ByVal cache As Object) As String
+    Dim k As Variant
+    If cache.Exists(projKey) Then ResolveProject = cache(projKey): Exit Function
+    If projDict.Exists(projKey) Then
+        ResolveProject = projKey
+    Else
+        ResolveProject = ""
+        For Each k In projDict.Keys
+            If Len(k) > 0 Then
+                If Right$(k, Len(projKey)) = projKey Or _
+                   (Len(projKey) >= Len(k) And Right$(projKey, Len(k)) = k) Then
+                    ResolveProject = k
+                    Exit For
+                End If
+            End If
+        Next k
+    End If
+    cache.Add projKey, ResolveProject
+End Function
+
+Private Sub LogUnresolved(ByVal col As Collection, ByVal srcRow As Long, ByVal fld As String, _
+                          ByVal txt As String, ByVal proj As String, ByVal id As Long)
+    If col.Count < MAX_UNRESOLVED_LISTED Then
+        col.Add srcRow & vbTab & proj & vbTab & id & vbTab & fld & vbTab & txt
+    End If
 End Sub
 
-Private Function UniqueSheetName(wb As Workbook, ByVal base As String) As String
-    Dim badChars As Variant, ch As Variant, nm As String, cand As String
-    Dim k As Long, suffix As String
+'==============================================================================
+'  Sheet / misc helpers
+'==============================================================================
+Private Function NodeLabel(ByVal v As Long, ByRef projDisp() As String, ByRef ids() As Long) As String
+    NodeLabel = projDisp(v) & "\" & ids(v)
+End Function
 
-    badChars = Array(":", "\", "/", "?", "*", "[", "]")
-    nm = base
-    For Each ch In badChars
-        nm = Replace(nm, ch, "_")
-    Next ch
-    nm = Trim$(nm)
-    Do While Left$(nm, 1) = "'": nm = Mid$(nm, 2): Loop
-    Do While Right$(nm, 1) = "'": nm = Left$(nm, Len(nm) - 1): Loop
-    If Len(nm) = 0 Then nm = "Loop"
-    If LCase$(nm) = "history" Then nm = nm & "_"
-    nm = Left$(nm, 31)
+Private Function SafeStr(ByVal x As Variant) As String
+    If IsError(x) Then SafeStr = "" Else SafeStr = CStr(x & "")
+End Function
 
-    cand = nm: k = 1
-    Do While SheetExists(wb, cand)
-        k = k + 1
-        suffix = " (" & k & ")"
-        cand = Left$(nm, 31 - Len(suffix)) & suffix
-    Loop
-    UniqueSheetName = cand
+Private Function FindHeaderRow(ws As Worksheet) As Long
+    Dim r As Long, c As Long, lastC As Long, hasID As Boolean, hasPred As Boolean, t As String
+    For r = 1 To 20
+        lastC = ws.Cells(r, ws.Columns.Count).End(xlToLeft).Column
+        hasID = False: hasPred = False
+        For c = 1 To lastC
+            t = UCase$(Trim$(SafeStr(ws.Cells(r, c).Value)))
+            If t = "ID" Then hasID = True
+            If t = "PREDECESSORS" Then hasPred = True
+        Next c
+        If hasID And hasPred Then FindHeaderRow = r: Exit Function
+    Next r
+    FindHeaderRow = 0
+End Function
+
+Private Function FindCol(ws As Worksheet, ByVal hdrRow As Long, ByVal lastCol As Long, ByVal name As String) As Long
+    Dim c As Long
+    For c = 1 To lastCol
+        If UCase$(Trim$(SafeStr(ws.Cells(hdrRow, c).Value))) = UCase$(name) Then FindCol = c: Exit Function
+    Next c
+    FindCol = 0
 End Function
 
 Private Function SheetExists(wb As Workbook, ByVal nm As String) As Boolean
-    Dim sh As Object
+    Dim ws As Worksheet
     On Error Resume Next
-    Set sh = wb.Sheets(nm)
+    Set ws = wb.Worksheets(nm)
     On Error GoTo 0
-    SheetExists = Not sh Is Nothing
+    SheetExists = Not ws Is Nothing
+End Function
+
+' Delete + recreate a sheet by name, placed after "afterWs"
+Private Function GetFreshSheet(wb As Workbook, ByVal nm As String, afterWs As Worksheet) As Worksheet
+    Dim prevAlerts As Boolean
+    If SheetExists(wb, nm) Then
+        prevAlerts = Application.DisplayAlerts
+        Application.DisplayAlerts = False
+        wb.Worksheets(nm).Delete
+        Application.DisplayAlerts = prevAlerts
+    End If
+    Set GetFreshSheet = wb.Worksheets.Add(After:=afterWs)
+    GetFreshSheet.Name = nm
+End Function
+
+' Build a legal, unique sheet name from the PUID (fallback: Project\ID)
+Private Function SafeSheetName(wb As Workbook, ByVal puid As String, ByVal proj As String, ByVal id As Long) As String
+    Dim bad As Variant, i As Long, base As String, s As String, k As Long, suffix As String
+    s = Trim$(puid)
+    If Len(s) = 0 Then s = "Loop_" & proj & "_" & id
+    bad = Array(":", "\", "/", "?", "*", "[", "]", "'")
+    For i = LBound(bad) To UBound(bad)
+        s = Replace(s, bad(i), "_")
+    Next i
+    If Len(s) > 31 Then s = Left$(s, 31)
+    base = s: k = 1
+    Do While SheetExists(wb, s)
+        k = k + 1
+        suffix = " (" & k & ")"
+        s = Left$(base, 31 - Len(suffix)) & suffix
+    Loop
+    SafeSheetName = s
 End Function
