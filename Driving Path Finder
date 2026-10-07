@@ -26,6 +26,7 @@ Option Explicit
 
 Private Const DRIVING_TOLERANCE_WD As Long = 1                    ' working days
 Private Const FOLLOW_NEAREST_WHEN_NONE_DRIVING As Boolean = False
+Private Const DEBUG_MODE As Boolean = False   ' True = no error trap; VBE stops on the failing line
 
 Private Const LAG_WORKING As Long = 0
 Private Const LAG_ELAPSED As Long = 1
@@ -61,6 +62,7 @@ Public Sub DrivingPathToPUID()
     Dim lProj As String, lID As Long, lType As String, lLag As Double, lKind As Long, lDesc As String, resolvedProj As String
     Dim targetPUID As String, target As Long, dupPUID As Long, unresolvedCnt As Long
     Dim prevScreen As Boolean, prevEvents As Boolean, prevCalc As XlCalculation, prevAlerts As Boolean
+    Dim titleTxt As String, datesTxt As String
     Dim t0 As Single
 
     Set wb = ActiveWorkbook
@@ -76,15 +78,15 @@ Public Sub DrivingPathToPUID()
         Exit Sub
     End If
     lastCol = wsSrc.Cells(hdrRow, wsSrc.Columns.Count).End(xlToLeft).Column
-    cID = DPFindCol(wsSrc, hdrRow, lastCol, "ID")
-    cProj = DPFindCol(wsSrc, hdrRow, lastCol, "Project")
-    cPUID = DPFindCol(wsSrc, hdrRow, lastCol, "PUID")
-    cName = DPFindCol(wsSrc, hdrRow, lastCol, "Name")
-    cStart = DPFindCol(wsSrc, hdrRow, lastCol, "Start")
-    cFin = DPFindCol(wsSrc, hdrRow, lastCol, "Finish")
-    cPred = DPFindCol(wsSrc, hdrRow, lastCol, "Predecessors")
-    cSucc = DPFindCol(wsSrc, hdrRow, lastCol, "Successors")
-    cTS = DPFindCol(wsSrc, hdrRow, lastCol, "Total Slack")
+    cID = DPFindColAny(wsSrc, hdrRow, lastCol, "ID")
+    cProj = DPFindColAny(wsSrc, hdrRow, lastCol, "Project")
+    cPUID = DPFindColAny(wsSrc, hdrRow, lastCol, "PUID")
+    cName = DPFindColAny(wsSrc, hdrRow, lastCol, "Name", "Task Name")
+    cStart = DPFindColAny(wsSrc, hdrRow, lastCol, "Start", "Start Date")
+    cFin = DPFindColAny(wsSrc, hdrRow, lastCol, "Finish", "Finish Date")
+    cPred = DPFindColAny(wsSrc, hdrRow, lastCol, "Predecessors")
+    cSucc = DPFindColAny(wsSrc, hdrRow, lastCol, "Successors")
+    cTS = DPFindColAny(wsSrc, hdrRow, lastCol, "Total Slack", "Total Slack (days)")
 
     If cID = 0 Or cProj = 0 Or cPUID = 0 Or cStart = 0 Or cFin = 0 Or cPred = 0 Or cSucc = 0 Then
         MsgBox "Missing one or more required columns (ID, Project, PUID, Start, Finish, Predecessors, Successors).", vbExclamation
@@ -109,7 +111,7 @@ Public Sub DrivingPathToPUID()
     Application.EnableEvents = False
     Application.Calculation = xlCalculationManual
     Application.StatusBar = "Driving path: reading data..."
-    On Error GoTo CleanFail
+    If Not DEBUG_MODE Then On Error GoTo CleanFail
     t0 = Timer
 
     '--------------------------------------------------------------------------
@@ -250,8 +252,8 @@ Public Sub DrivingPathToPUID()
 
         If cntTotal = 0 Then
             startCnt = startCnt + 1
-            status(v) = status(v) & " | PATH START - no predecessors found in export" & _
-                        IIf(Len(nodeUnres(v)) > 0, " (unresolved links: " & nodeUnres(v) & ")", "")
+            status(v) = status(v) & " | PATH START - no predecessors found in export"
+            If Len(nodeUnres(v)) > 0 Then status(v) = status(v) & " (unresolved links: " & nodeUnres(v) & ")"
         ElseIf cntValid = 0 Then
             startCnt = startCnt + 1
             status(v) = status(v) & " | PATH START - predecessors have no usable Start/Finish dates"
@@ -352,6 +354,15 @@ Public Sub DrivingPathToPUID()
         outArr(rowI, lastCol + 7) = status(v)
     Next i
 
+    ' header text – built with real If blocks (IIf evaluates BOTH branches and
+    ' would index column 0 when an optional column is absent)
+    titleTxt = "DRIVING PATH TO " & DPLabel(target) & "    PUID: " & targetPUID
+    If cName > 0 Then titleTxt = titleTxt & "    " & DPSafeStr(data(nodeRow(target), cName))
+
+    datesTxt = "Target Start: " & DPSafeStr(data(nodeRow(target), cStart)) & _
+               "    Finish: " & DPSafeStr(data(nodeRow(target), cFin))
+    If cTS > 0 Then datesTxt = datesTxt & "    Total Slack: " & DPSafeStr(data(nodeRow(target), cTS))
+
     Dim shName As String
     shName = DPSafeSheetName("DP to " & targetPUID)
     If DPSheetExists(wb, shName) Then
@@ -364,19 +375,17 @@ Public Sub DrivingPathToPUID()
     wsOut.Name = shName
 
     With wsOut
-        .Cells(1, 1).Value = "DRIVING PATH TO " & DPLabel(target) & "    PUID: " & targetPUID & _
-                             IIf(cName > 0, "    " & DPSafeStr(data(nodeRow(target), cName)), "")
+        .Cells(1, 1).Value = titleTxt
         .Cells(1, 1).Font.Bold = True
-        .Cells(2, 1).Value = "Target Start: " & DPSafeStr(data(nodeRow(target), cStart)) & _
-                             "    Finish: " & DPSafeStr(data(nodeRow(target), cFin)) & _
-                             IIf(cTS > 0, "    Total Slack: " & DPSafeStr(data(nodeRow(target), cTS)), "")
+        .Cells(2, 1).Value = datesTxt
         .Cells(3, 1).Value = "Method: each predecessor link (FS/SS/FF/SF + lag) is checked against the successor's Start/Finish on a Mon-Fri calendar. " & _
                              "A predecessor is DRIVING when it requires the latest date of all predecessors and the successor's date is within " & _
                              DRIVING_TOLERANCE_WD & " working day(s) of it. Ties are all followed."
         .Cells(4, 1).Value = "Tasks on path: " & cnt & "    |    Path start points: " & startCnt & _
                              "    |    Follow nearest predecessor when none is driving: " & IIf(FOLLOW_NEAREST_WHEN_NONE_DRIVING, "Yes", "No") & _
-                             "    |    Unresolved links in export: " & unresolvedCnt & _
-                             IIf(dupPUID > 0, "    |    WARNING: PUID appears " & (dupPUID + 1) & " times - first occurrence used", "")
+                             "    |    Unresolved links in export: " & unresolvedCnt
+        If dupPUID > 0 Then .Cells(4, 1).Value = .Cells(4, 1).Value & _
+                             "    |    WARNING: PUID appears " & (dupPUID + 1) & " times - first occurrence used"
         .Cells(6, 1).Resize(cnt + 1, oc).Value = outArr
         .Cells(6, 1).Resize(1, oc).Font.Bold = True
         .Columns(lastCol + 5).NumberFormat = "m/d/yyyy"
@@ -608,7 +617,8 @@ Private Function DPParseLink(ByVal item As String, ByVal curProjKey As String, _
         End Select
     End If
     lagStr = restPart
-    outDesc = outType & IIf(Len(lagStr) > 0, " " & lagStr, "")
+    outDesc = outType
+    If Len(lagStr) > 0 Then outDesc = outDesc & " " & lagStr
     If Len(restPart) = 0 Then DPParseLink = True: Exit Function
 
     ' Lag
@@ -729,6 +739,17 @@ Private Function DPFindCol(ws As Worksheet, ByVal hdrRow As Long, ByVal lastCol 
         If UCase$(Trim$(DPSafeStr(ws.Cells(hdrRow, c).Value))) = UCase$(nm) Then DPFindCol = c: Exit Function
     Next c
     DPFindCol = 0
+End Function
+
+' Try several header spellings in order; returns 0 if none match
+Private Function DPFindColAny(ws As Worksheet, ByVal hdrRow As Long, ByVal lastCol As Long, _
+                              ParamArray names() As Variant) As Long
+    Dim i As Long
+    For i = LBound(names) To UBound(names)
+        DPFindColAny = DPFindCol(ws, hdrRow, lastCol, CStr(names(i)))
+        If DPFindColAny > 0 Then Exit Function
+    Next i
+    DPFindColAny = 0
 End Function
 
 Private Function DPSheetExists(wb As Workbook, ByVal nm As String) As Boolean
