@@ -221,7 +221,7 @@ Public Sub DrivingPathToPUID()
     Dim visited() As Boolean, lvl() As Long, drives() As String, linkTo() As String
     Dim impDate() As Double, gapWD() As Double, hasGap() As Boolean, status() As String
     Dim queue() As Long, qh As Long, qt As Long
-    Dim minGap As Double, g As Double, imp As Double, cntTotal As Long, cntValid As Long, nearestE As Long
+    Dim minGap As Double, g As Double, reqDate As Double, cntTotal As Long, cntValid As Long, nearestE As Long
     Dim pathTasks As Long, startCnt As Long
 
     ReDim visited(1 To n): ReDim lvl(1 To n): ReDim drives(1 To n): ReDim linkTo(1 To n)
@@ -241,7 +241,7 @@ Public Sub DrivingPathToPUID()
         Do While e <> 0
             p = mInSrc(e)
             cntTotal = cntTotal + 1
-            If DPEvalLink(e, p, v, nStart, nFin, imp, g) Then
+            If DPEvalLink(e, p, v, nStart, nFin, reqDate, g) Then
                 cntValid = cntValid + 1
                 If g < minGap Then minGap = g: nearestE = e
             End If
@@ -265,7 +265,7 @@ Public Sub DrivingPathToPUID()
             e = mInHead(v)
             Do While e <> 0
                 p = mInSrc(e)
-                If DPEvalLink(e, p, v, nStart, nFin, imp, g) Then
+                If DPEvalLink(e, p, v, nStart, nFin, reqDate, g) Then
                     If g = minGap Then
                         If Not visited(p) Then
                             visited(p) = True
@@ -274,7 +274,7 @@ Public Sub DrivingPathToPUID()
                             pathTasks = pathTasks + 1
                             drives(p) = DPLabel(v)
                             linkTo(p) = mLnkDesc(e)
-                            impDate(p) = imp: gapWD(p) = g: hasGap(p) = True
+                            impDate(p) = reqDate: gapWD(p) = g: hasGap(p) = True
                             If minGap > DRIVING_TOLERANCE_WD Then
                                 status(p) = "NEAR-DRIVING (gap exceeds tolerance - followed as nearest predecessor)"
                             ElseIf g < 0 Then
@@ -411,7 +411,7 @@ End Sub
 '==============================================================================
 Private Function DPEvalLink(ByVal e As Long, ByVal p As Long, ByVal v As Long, _
                             ByRef nStart() As Double, ByRef nFin() As Double, _
-                            ByRef imp As Double, ByRef g As Double) As Boolean
+                            ByRef reqDate As Double, ByRef g As Double) As Boolean
     Dim typ As String, lag As Double, kind As Long, base As Double, actual As Double
     Dim lagWD As Long, lagCD As Long, durWD As Long
 
@@ -439,20 +439,20 @@ Private Function DPEvalLink(ByVal e As Long, ByVal p As Long, ByVal v As Long, _
     If kind = LAG_ELAPSED Then
         lagCD = CLng(Round(lag, 0))
         Select Case typ
-            Case "FS":       imp = DPNextWorkday(base + lagCD)
-            Case "SS", "FF": imp = DPRollForward(base + lagCD)
-            Case "SF":       imp = DPAddWorkdays(DPRollForward(base + lagCD), -1)
+            Case "FS":       reqDate = DPNextWorkday(base + lagCD)
+            Case "SS", "FF": reqDate = DPRollForward(base + lagCD)
+            Case "SF":       reqDate = DPAddWorkdays(DPRollForward(base + lagCD), -1)
         End Select
     Else
         lagWD = CLng(Round(lag, 0))
         Select Case typ
-            Case "FS":       imp = DPAddWorkdays(base, lagWD + 1)
-            Case "SS", "FF": imp = DPAddWorkdays(base, lagWD)
-            Case "SF":       imp = DPAddWorkdays(base, lagWD - 1)
+            Case "FS":       reqDate = DPAddWorkdays(base, lagWD + 1)
+            Case "SS", "FF": reqDate = DPAddWorkdays(base, lagWD)
+            Case "SF":       reqDate = DPAddWorkdays(base, lagWD - 1)
         End Select
     End If
 
-    g = DPWorkdaysBetween(imp, actual)
+    g = DPWorkdaysBetween(reqDate, actual)
     DPEvalLink = True
 End Function
 
