@@ -1,0 +1,893 @@
+Option Explicit
+
+'=====================================================================
+'  DCMA 14-POINT SCHEDULE ASSESSMENT  -  for Microsoft Project exports
+'---------------------------------------------------------------------
+'  Run RunDCMA14PointAssessment with the exported MS Project sheet
+'  active. Creates a "DCMA Summary" tab plus one tab per check
+'  listing every task that tripped it.
+'=====================================================================
+
+'---------------------------- Settings -------------------------------
+Private Const HIGH_FLOAT_DAYS As Double = 44       ' Check 6 threshold (working days)
+Private Const HIGH_DURATION_DAYS As Double = 44    ' Check 8 threshold (working days)
+Private Const HOURS_PER_DAY As Double = 8          ' Used when durations are exported in hours
+Private Const DAYS_PER_WEEK As Double = 5
+Private Const DAYS_PER_MONTH As Double = 20
+Private Const FLAG_ALAP_AS_HARD As Boolean = False ' Set True to also flag "As Late As Possible" in Check 5
+Private Const SUMMARY_SHEET As String = "DCMA Summary"
+
+'---------------------------- Types ----------------------------------
+Private Type TaskRec
+    Row As Long
+    ID As Long
+    Name As String
+    OutlineLevel As Long
+    IsSummary As Boolean
+    IsMilestone As Boolean
+    IsCritical As Boolean
+    Dur As Double
+    RemDur As Double
+    PctComplete As Double
+    TotalSlack As Double
+    HasStart As Boolean:        StartDt As Date
+    HasFinish As Boolean:       FinishDt As Date
+    HasActStart As Boolean:     ActStart As Date
+    HasActFinish As Boolean:    ActFinish As Date
+    HasBLStart As Boolean:      BLStart As Date
+    HasBLFinish As Boolean:     BLFinish As Date
+    HasConstraintDate As Boolean: ConstraintDate As Date
+    ConstraintType As String
+    Preds As String
+    Succs As String
+    Resources As String
+End Type
+
+Private Type CheckDef
+    Title As String
+    Description As String
+    Threshold As String
+    Metric As String
+    Result As String        ' PASS / FAIL / MANUAL / N/A
+    SheetName As String
+End Type
+
+'---------------------------- Module state ---------------------------
+Private Tasks() As TaskRec
+Private TaskCount As Long
+Private Checks(1 To 14) As CheckDef
+Private Findings(1 To 14) As Collection    ' each item = Array(taskIndex, findingText)
+Private IdMap As Collection                ' key = CStr(ID), item = task index
+Private Notes As Collection
+Private StatusDate As Date
+Private gNonSummary As Long, gIncomplete As Long, gRelTotal As Long
+
+' Column indices (0 = column not present in export)
+Private cID As Long, cName As Long, cSummary As Long, cMilestone As Long, cOutline As Long
+Private cDur As Long, cRemDur As Long, cStart As Long, cFinish As Long
+Private cActStart As Long, cActFinish As Long, cBLStart As Long, cBLFinish As Long
+Private cSlack As Long, cPct As Long, cConstrType As Long, cConstrDate As Long
+Private cPreds As Long, cSuccs As Long, cRes As Long, cCritical As Long
+
+'=====================================================================
+'  ENTRY POINT
+'=====================================================================
+Public Sub RunDCMA14PointAssessment()
+    Dim wsData As Worksheet, hdrRow As Long, s As String
+
+    Set wsData = ActiveSheet
+    If MsgBox("Run the DCMA 14-Point Assessment against sheet '" & wsData.Name & "'?" & vbCrLf & vbCrLf & _
+              "Existing DCMA result tabs in this workbook will be replaced.", _
+              vbYesNo + vbQuestion, "DCMA 14-Point") <> vbYes Then Exit Sub
+
+    hdrRow = FindHeaderRow(wsData)
+    If hdrRow = 0 Then
+        MsgBox "Could not find a header row containing 'Name' or 'Task Name' in the first 20 rows.", vbExclamation
+        Exit Sub
+    End If
+    If Not MapColumns(wsData, hdrRow) Then Exit Sub
+
+    s = InputBox("Enter the schedule Status Date (data date):", "DCMA 14-Point", Format(Date, "Short Date"))
+    If Len(s) = 0 Then Exit Sub
+    If Not IsDate(s) Then
+        MsgBox "'" & s & "' is not a valid date.", vbExclamation
+        Exit Sub
+    End If
+    StatusDate = CDate(s)
+
+    On Error GoTo ErrHandler
+    Application.ScreenUpdating = False
+    Application.StatusBar = "DCMA: loading tasks..."
+    LoadTasks wsData, hdrRow
+    InitChecks
+    Application.StatusBar = "DCMA: running checks..."
+    RunChecks
+    Application.StatusBar = "DCMA: writing results..."
+    WriteOutput wsData
+    Application.StatusBar = False
+    Application.ScreenUpdating = True
+    MsgBox "DCMA 14-Point Assessment complete." & vbCrLf & TaskCount & " tasks loaded, " & _
+           gNonSummary & " non-summary tasks evaluated.", vbInformation, "DCMA 14-Point"
+    Exit Sub
+
+ErrHandler:
+    Application.StatusBar = False
+    Application.ScreenUpdating = True
+    Application.DisplayAlerts = True
+    MsgBox "Error " & Err.Number & ": " & Err.Description, vbCritical, "DCMA 14-Point"
+End Sub
+
+'=====================================================================
+'  COLUMN MAPPING
+'=====================================================================
+Private Function FindHeaderRow(ws As Worksheet) As Long
+    Dim r As Long, c As Long, lastCol As Long, v As String
+    For r = 1 To 20
+        lastCol = ws.Cells(r, ws.Columns.Count).End(xlToLeft).Column
+        For c = 1 To lastCol
+            v = LCase(Trim(ws.Cells(r, c).Text))
+            If v = "name" Or v = "task name" Then
+                FindHeaderRow = r
+                Exit Function
+            End If
+        Next c
+    Next r
+End Function
+
+Private Function FindCol(ws As Worksheet, hdrRow As Long, ParamArray aliases() As Variant) As Long
+    Dim lastCol As Long, c As Long, i As Long, v As String
+    lastCol = ws.Cells(hdrRow, ws.Columns.Count).End(xlToLeft).Column
+    For c = 1 To lastCol
+        v = LCase(Trim(ws.Cells(hdrRow, c).Text))
+        For i = LBound(aliases) To UBound(aliases)
+            If v = LCase(aliases(i)) Then
+                FindCol = c
+                Exit Function
+            End If
+        Next i
+    Next c
+End Function
+
+Private Function MapColumns(ws As Worksheet, hdrRow As Long) As Boolean
+    cID = FindCol(ws, hdrRow, "ID", "Task ID")
+    cName = FindCol(ws, hdrRow, "Name", "Task Name")
+    cSummary = FindCol(ws, hdrRow, "Summary")
+    cMilestone = FindCol(ws, hdrRow, "Milestone")
+    cOutline = FindCol(ws, hdrRow, "Outline Level")
+    cDur = FindCol(ws, hdrRow, "Duration")
+    cRemDur = FindCol(ws, hdrRow, "Remaining Duration")
+    cStart = FindCol(ws, hdrRow, "Start", "Start Date")
+    cFinish = FindCol(ws, hdrRow, "Finish", "Finish Date")
+    cActStart = FindCol(ws, hdrRow, "Actual Start")
+    cActFinish = FindCol(ws, hdrRow, "Actual Finish")
+    cBLStart = FindCol(ws, hdrRow, "Baseline Start")
+    cBLFinish = FindCol(ws, hdrRow, "Baseline Finish")
+    cSlack = FindCol(ws, hdrRow, "Total Slack", "Total Float")
+    cPct = FindCol(ws, hdrRow, "% Complete", "Percent Complete", "Pct Complete")
+    cConstrType = FindCol(ws, hdrRow, "Constraint Type")
+    cConstrDate = FindCol(ws, hdrRow, "Constraint Date")
+    cPreds = FindCol(ws, hdrRow, "Predecessors")
+    cSuccs = FindCol(ws, hdrRow, "Successors")
+    cRes = FindCol(ws, hdrRow, "Resource Names", "Resources")
+    cCritical = FindCol(ws, hdrRow, "Critical")
+
+    Dim missing As String
+    If cID = 0 Then missing = missing & vbCrLf & "  - ID"
+    If cName = 0 Then missing = missing & vbCrLf & "  - Name"
+    If cPreds = 0 Then missing = missing & vbCrLf & "  - Predecessors"
+    If Len(missing) > 0 Then
+        MsgBox "Required column(s) not found on header row " & hdrRow & ":" & missing, vbExclamation, "DCMA 14-Point"
+        Exit Function
+    End If
+    MapColumns = True
+End Function
+
+'=====================================================================
+'  LOAD TASKS
+'=====================================================================
+Private Sub LoadTasks(ws As Worksheet, hdrRow As Long)
+    Dim lastRow As Long, lastCol As Long, r As Long, n As Long, data As Variant
+    Dim s As String, maxPct As Double
+
+    Set Notes = New Collection
+    Set IdMap = New Collection
+
+    lastRow = ws.Cells(ws.Rows.Count, cName).End(xlUp).Row
+    If ws.Cells(ws.Rows.Count, cID).End(xlUp).Row > lastRow Then lastRow = ws.Cells(ws.Rows.Count, cID).End(xlUp).Row
+    lastCol = ws.Cells(hdrRow, ws.Columns.Count).End(xlToLeft).Column
+    If lastRow <= hdrRow Then Err.Raise vbObjectError + 1, , "No task rows were found below the header row."
+
+    data = ws.Range(ws.Cells(hdrRow + 1, 1), ws.Cells(lastRow, lastCol)).Value
+    ReDim Tasks(1 To UBound(data, 1))
+
+    For r = 1 To UBound(data, 1)
+        s = Trim(GetStr(data, r, cID))
+        If Len(s) = 0 Then GoTo NextRow            ' blank row
+        If Not IsNumeric(s) Then GoTo NextRow      ' repeated header / junk row
+        n = n + 1
+        With Tasks(n)
+            .Row = hdrRow + r
+            .ID = CLng(Val(s))
+            .Name = GetStr(data, r, cName)
+            If cOutline > 0 Then .OutlineLevel = CLng(Val(GetStr(data, r, cOutline)))
+            If cSummary > 0 Then .IsSummary = ParseBool(GetStr(data, r, cSummary))
+            .Dur = ParseDurationDays(GetStr(data, r, cDur))
+            If cMilestone > 0 Then
+                .IsMilestone = ParseBool(GetStr(data, r, cMilestone))
+            Else
+                .IsMilestone = (.Dur = 0)
+            End If
+            s = Replace(GetStr(data, r, cPct), "%", "")
+            If IsNumeric(s) Then .PctComplete = CDbl(s)
+            If .PctComplete > maxPct Then maxPct = .PctComplete
+            If cRemDur > 0 Then .RemDur = ParseDurationDays(GetStr(data, r, cRemDur)) Else .RemDur = -1
+            .HasStart = TryDate(GetCell(data, r, cStart), .StartDt)
+            .HasFinish = TryDate(GetCell(data, r, cFinish), .FinishDt)
+            .HasActStart = TryDate(GetCell(data, r, cActStart), .ActStart)
+            .HasActFinish = TryDate(GetCell(data, r, cActFinish), .ActFinish)
+            .HasBLStart = TryDate(GetCell(data, r, cBLStart), .BLStart)
+            .HasBLFinish = TryDate(GetCell(data, r, cBLFinish), .BLFinish)
+            .TotalSlack = ParseDurationDays(GetStr(data, r, cSlack))
+            .ConstraintType = GetStr(data, r, cConstrType)
+            .HasConstraintDate = TryDate(GetCell(data, r, cConstrDate), .ConstraintDate)
+            .Preds = GetStr(data, r, cPreds)
+            .Succs = GetStr(data, r, cSuccs)
+            .Resources = GetStr(data, r, cRes)
+            If cCritical > 0 Then
+                .IsCritical = ParseBool(GetStr(data, r, cCritical))
+            Else
+                .IsCritical = (cSlack > 0 And .TotalSlack <= 0)
+            End If
+            On Error Resume Next
+            IdMap.Add n, CStr(.ID)
+            On Error GoTo 0
+        End With
+NextRow:
+    Next r
+
+    TaskCount = n
+    If TaskCount = 0 Then Err.Raise vbObjectError + 2, , "No tasks with a numeric ID were found."
+    ReDim Preserve Tasks(1 To TaskCount)
+
+    '---- post-processing ----
+    Dim scalePct As Boolean
+    scalePct = (cPct > 0 And maxPct > 0 And maxPct <= 1)   ' values stored as 0..1 fractions
+    For r = 1 To TaskCount
+        With Tasks(r)
+            If scalePct Then .PctComplete = .PctComplete * 100
+            If .RemDur < 0 Then .RemDur = .Dur * (1 - .PctComplete / 100)
+        End With
+    Next r
+    ' Infer summary tasks from outline level if the Summary field was not exported
+    If cSummary = 0 And cOutline > 0 Then
+        For r = 1 To TaskCount - 1
+            Tasks(r).IsSummary = (Tasks(r + 1).OutlineLevel > Tasks(r).OutlineLevel)
+        Next r
+    End If
+
+    '---- notes ----
+    If cSummary = 0 And cOutline = 0 Then Notes.Add "No 'Summary' or 'Outline Level' column exported - all rows treated as detail tasks, so summary tasks may inflate counts (especially Check 1)."
+    If cSummary = 0 And cOutline > 0 Then Notes.Add "No 'Summary' column exported - summary tasks were inferred from Outline Level."
+    If cMilestone = 0 Then Notes.Add "No 'Milestone' column exported - tasks with zero duration were treated as milestones."
+    If cCritical = 0 Then Notes.Add "No 'Critical' column exported - tasks with Total Slack <= 0 were treated as critical (Check 12 listing)."
+    If cRemDur = 0 Then Notes.Add "No 'Remaining Duration' column exported - estimated as Duration x (1 - % Complete)."
+    If cSuccs = 0 Then Notes.Add "No 'Successors' column exported - Check 1 only tests for missing predecessors."
+    If scalePct Then Notes.Add "% Complete values were fractions (0-1) and were scaled to 0-100."
+    Notes.Add "Durations/slack converted to days assuming " & HOURS_PER_DAY & " hrs/day, " & DAYS_PER_WEEK & " days/week, " & DAYS_PER_MONTH & " days/month."
+    Notes.Add "Relationship checks (2, 3, 4) count relationships from the Predecessors field of incomplete tasks."
+    Notes.Add "Level-of-Effort (LOE) tasks are not excluded automatically; the analyst should remove them from Checks 1, 6 and 8 if applicable."
+    Notes.Add "The project start milestone (no predecessor) and finish milestone (no successor) will appear on Check 1 and are normally accepted exceptions."
+    Notes.Add "Check 10 (Resources) is informational for schedules that are not resource-loaded."
+End Sub
+
+'=====================================================================
+'  CHECK DEFINITIONS
+'=====================================================================
+Private Sub InitChecks()
+    SetDef 1, "Logic", "01 Logic", "<= 5% of incomplete tasks", _
+        "Incomplete tasks missing a predecessor and/or a successor."
+    SetDef 2, "Leads", "02 Leads", "0% of relationships", _
+        "Relationships on incomplete tasks that have negative lag (a lead)."
+    SetDef 3, "Lags", "03 Lags", "<= 5% of relationships", _
+        "Relationships on incomplete tasks that have positive lag."
+    SetDef 4, "Relationship Types", "04 Relationship Types", ">= 90% Finish-to-Start", _
+        "Share of relationships that are Finish-to-Start. Non-FS (SS, FF, SF) relationships are listed."
+    SetDef 5, "Hard Constraints", "05 Hard Constraints", "<= 5% of incomplete tasks", _
+        "Incomplete tasks with Must Start On, Must Finish On, Start No Later Than or Finish No Later Than constraints" & IIf(FLAG_ALAP_AS_HARD, " (plus As Late As Possible).", ".")
+    SetDef 6, "High Float", "06 High Float", "<= 5% of incomplete tasks", _
+        "Incomplete tasks with total slack greater than " & HIGH_FLOAT_DAYS & " working days."
+    SetDef 7, "Negative Float", "07 Negative Float", "0 tasks", _
+        "Incomplete tasks with total slack less than zero."
+    SetDef 8, "High Duration", "08 High Duration", "<= 5% of incomplete tasks", _
+        "Incomplete, non-milestone tasks with remaining duration greater than " & HIGH_DURATION_DAYS & " working days."
+    SetDef 9, "Invalid Dates", "09 Invalid Dates", "0 tasks", _
+        "Forecast start/finish dates earlier than the status date, or actual start/finish dates later than the status date."
+    SetDef 10, "Resources", "10 Resources", "0 tasks (informational if not resource-loaded)", _
+        "Incomplete tasks with duration > 0 that have no resources assigned."
+    SetDef 11, "Missed Tasks", "11 Missed Tasks", "<= 5% of tasks baselined to finish by status date", _
+        "Tasks whose baseline finish is on or before the status date that either finished late or have not finished."
+    SetDef 12, "Critical Path Test", "12 Critical Path Test", "Manual: project finish moves by the full amount", _
+        "Manual test - in MS Project add a large duration (e.g. 600 days) to one incomplete critical task and confirm the project finish date moves by the same amount, then undo. This tab lists incomplete tasks currently on the critical path to choose from."
+    SetDef 13, "Critical Path Length Index (CPLI)", "13 CPLI", ">= 0.95", _
+        "CPLI = (Critical Path Length + Total Float) / Critical Path Length, where CPL is the working days from the status date to the project finish."
+    SetDef 14, "Baseline Execution Index (BEI)", "14 BEI", ">= 0.95", _
+        "BEI = tasks actually completed / tasks baselined to be complete on or before the status date."
+End Sub
+
+Private Sub SetDef(k As Long, title As String, sheetName As String, threshold As String, desc As String)
+    Checks(k).Title = title
+    Checks(k).SheetName = sheetName
+    Checks(k).Threshold = threshold
+    Checks(k).Description = desc
+End Sub
+
+'=====================================================================
+'  RUN CHECKS
+'=====================================================================
+Private Sub RunChecks()
+    Dim i As Long, k As Long, t As Long
+    Dim incompleteCnt As Long, relTotal As Long, leadCnt As Long, lagCnt As Long, fsCnt As Long
+    Dim hardCnt As Long, highFloatCnt As Long, negFloatCnt As Long, highDurCnt As Long, highDurBase As Long
+    Dim invalidCnt As Long, noResCnt As Long, noResBase As Long
+    Dim missedCnt As Long, blDueCnt As Long, completedCnt As Long, nonSummaryCnt As Long
+    Dim isIncomplete As Boolean, isComplete As Boolean, flagged As Boolean
+    Dim toks() As String, pid As Long, rel As String, lag As Double, linkTxt As String, ct As String
+
+    For k = 1 To 14
+        Set Findings(k) = New Collection
+    Next k
+
+    For i = 1 To TaskCount
+        With Tasks(i)
+            If .IsSummary Then GoTo NextTask
+            nonSummaryCnt = nonSummaryCnt + 1
+            isComplete = .HasActFinish Or (.PctComplete >= 100)
+            isIncomplete = Not isComplete
+
+            If isIncomplete Then
+                incompleteCnt = incompleteCnt + 1
+
+                '---- 1. Logic ----
+                If cSuccs > 0 Then
+                    If Len(Trim(.Preds)) = 0 And Len(Trim(.Succs)) = 0 Then
+                        Findings(1).Add Array(i, "Missing predecessor AND successor")
+                    ElseIf Len(Trim(.Preds)) = 0 Then
+                        Findings(1).Add Array(i, "Missing predecessor")
+                    ElseIf Len(Trim(.Succs)) = 0 Then
+                        Findings(1).Add Array(i, "Missing successor")
+                    End If
+                Else
+                    If Len(Trim(.Preds)) = 0 Then Findings(1).Add Array(i, "Missing predecessor (Successors column not exported)")
+                End If
+
+                '---- 2, 3, 4. Relationships ----
+                toks = Split(Replace(.Preds, ";", ","), ",")
+                For t = LBound(toks) To UBound(toks)
+                    If ParseLink(toks(t), pid, rel, lag) Then
+                        relTotal = relTotal + 1
+                        linkTxt = "'" & Trim(toks(t)) & "' -> predecessor ID " & pid & " (" & TaskNameByID(pid) & ")"
+                        If lag < 0 Then
+                            leadCnt = leadCnt + 1
+                            Findings(2).Add Array(i, "Lead of " & lag & " days: " & linkTxt)
+                        ElseIf lag > 0 Then
+                            lagCnt = lagCnt + 1
+                            Findings(3).Add Array(i, "Lag of " & lag & " days: " & linkTxt)
+                        End If
+                        If rel = "FS" Then
+                            fsCnt = fsCnt + 1
+                        Else
+                            Findings(4).Add Array(i, rel & " relationship: " & linkTxt)
+                        End If
+                    End If
+                Next t
+
+                '---- 5. Hard constraints ----
+                If cConstrType > 0 Then
+                    ct = LCase(Trim(.ConstraintType))
+                    flagged = (ct = "must start on" Or ct = "must finish on" Or _
+                               ct = "start no later than" Or ct = "finish no later than")
+                    If FLAG_ALAP_AS_HARD And ct = "as late as possible" Then flagged = True
+                    If flagged Then
+                        hardCnt = hardCnt + 1
+                        Findings(5).Add Array(i, "Hard constraint: " & .ConstraintType & _
+                            IIf(.HasConstraintDate, " (" & Format(.ConstraintDate, "dd-mmm-yyyy") & ")", ""))
+                    End If
+                End If
+
+                '---- 6, 7. Float ----
+                If cSlack > 0 Then
+                    If .TotalSlack > HIGH_FLOAT_DAYS Then
+                        highFloatCnt = highFloatCnt + 1
+                        Findings(6).Add Array(i, "Total slack of " & .TotalSlack & " days exceeds " & HIGH_FLOAT_DAYS & " days")
+                    ElseIf .TotalSlack < 0 Then
+                        negFloatCnt = negFloatCnt + 1
+                        Findings(7).Add Array(i, "Negative total slack: " & .TotalSlack & " days")
+                    End If
+                End If
+
+                '---- 8. High duration ----
+                If Not .IsMilestone Then
+                    highDurBase = highDurBase + 1
+                    If .RemDur > HIGH_DURATION_DAYS Then
+                        highDurCnt = highDurCnt + 1
+                        Findings(8).Add Array(i, "Remaining duration of " & Format(.RemDur, "0.##") & " days exceeds " & HIGH_DURATION_DAYS & " days")
+                    End If
+                End If
+
+                '---- 9. Invalid forecast dates ----
+                If .HasStart And Not .HasActStart Then
+                    If .StartDt < StatusDate Then
+                        invalidCnt = invalidCnt + 1
+                        Findings(9).Add Array(i, "Forecast start " & Format(.StartDt, "dd-mmm-yyyy") & " is before the status date with no actual start")
+                    End If
+                End If
+                If .HasFinish Then
+                    If .FinishDt < StatusDate Then
+                        invalidCnt = invalidCnt + 1
+                        Findings(9).Add Array(i, "Forecast finish " & Format(.FinishDt, "dd-mmm-yyyy") & " is before the status date with no actual finish")
+                    End If
+                End If
+
+                '---- 10. Resources ----
+                If cRes > 0 And .Dur > 0 And Not .IsMilestone Then
+                    noResBase = noResBase + 1
+                    If Len(Trim(.Resources)) = 0 Then
+                        noResCnt = noResCnt + 1
+                        Findings(10).Add Array(i, "No resources assigned (duration " & Format(.Dur, "0.##") & " days)")
+                    End If
+                End If
+
+                '---- 12. Critical path listing ----
+                If .IsCritical Then Findings(12).Add Array(i, "Incomplete task on the critical path")
+            Else
+                completedCnt = completedCnt + 1
+            End If
+
+            '---- 9. Invalid actual dates (all tasks) ----
+            If .HasActStart Then
+                If .ActStart > StatusDate Then
+                    invalidCnt = invalidCnt + 1
+                    Findings(9).Add Array(i, "Actual start " & Format(.ActStart, "dd-mmm-yyyy") & " is after the status date")
+                End If
+            End If
+            If .HasActFinish Then
+                If .ActFinish > StatusDate Then
+                    invalidCnt = invalidCnt + 1
+                    Findings(9).Add Array(i, "Actual finish " & Format(.ActFinish, "dd-mmm-yyyy") & " is after the status date")
+                End If
+            End If
+
+            '---- 11. Missed tasks  /  14. BEI ----
+            If .HasBLFinish Then
+                If .BLFinish <= StatusDate Then
+                    blDueCnt = blDueCnt + 1
+                    If isIncomplete Then
+                        missedCnt = missedCnt + 1
+                        Findings(11).Add Array(i, "Baseline finish " & Format(.BLFinish, "dd-mmm-yyyy") & _
+                            " has passed and task is not complete (forecast finish " & _
+                            IIf(.HasFinish, Format(.FinishDt, "dd-mmm-yyyy"), "n/a") & ")")
+                        Findings(14).Add Array(i, "Baselined to finish by the status date but not complete")
+                    ElseIf .HasActFinish Then
+                        If .ActFinish > .BLFinish Then
+                            missedCnt = missedCnt + 1
+                            Findings(11).Add Array(i, "Finished " & Format(.ActFinish, "dd-mmm-yyyy") & _
+                                ", after baseline finish of " & Format(.BLFinish, "dd-mmm-yyyy"))
+                        End If
+                    End If
+                End If
+            End If
+        End With
+NextTask:
+    Next i
+
+    gNonSummary = nonSummaryCnt
+    gIncomplete = incompleteCnt
+    gRelTotal = relTotal
+
+    '================= Results / thresholds =================
+    SetPctResult 1, Findings(1).Count, incompleteCnt, 5, "incomplete tasks missing logic"
+    SetPctResult 2, leadCnt, relTotal, 0, "relationships with leads"
+    SetPctResult 3, lagCnt, relTotal, 5, "relationships with lags"
+
+    If relTotal = 0 Then
+        SetNA 4, "No relationships found"
+    Else
+        Checks(4).Metric = fsCnt & " of " & relTotal & " relationships are FS (" & Format(fsCnt / relTotal, "0.0%") & ")"
+        Checks(4).Result = IIf(fsCnt / relTotal >= 0.9, "PASS", "FAIL")
+    End If
+
+    If cConstrType = 0 Then SetNA 5, "Constraint Type column not exported" _
+        Else SetPctResult 5, hardCnt, incompleteCnt, 5, "incomplete tasks with hard constraints"
+    If cSlack = 0 Then SetNA 6, "Total Slack column not exported" _
+        Else SetPctResult 6, highFloatCnt, incompleteCnt, 5, "incomplete tasks with high float"
+    If cSlack = 0 Then SetNA 7, "Total Slack column not exported" _
+        Else SetPctResult 7, negFloatCnt, incompleteCnt, 0, "incomplete tasks with negative float"
+    SetPctResult 8, highDurCnt, highDurBase, 5, "incomplete non-milestone tasks with high duration"
+
+    If cStart = 0 And cFinish = 0 And cActStart = 0 And cActFinish = 0 Then
+        SetNA 9, "No Start/Finish/Actual date columns exported"
+    Else
+        Checks(9).Metric = invalidCnt & " invalid date condition(s) found"
+        Checks(9).Result = IIf(invalidCnt = 0, "PASS", "FAIL")
+    End If
+
+    If cRes = 0 Then SetNA 10, "Resource Names column not exported" _
+        Else SetPctResult 10, noResCnt, noResBase, 0, "incomplete tasks (duration > 0) without resources"
+    If cBLFinish = 0 Then SetNA 11, "Baseline Finish column not exported" _
+        Else SetPctResult 11, missedCnt, blDueCnt, 5, "tasks baselined to finish by the status date that missed"
+
+    Checks(12).Metric = Findings(12).Count & " incomplete task(s) currently on the critical path - perform the manual test in MS Project"
+    Checks(12).Result = "MANUAL"
+
+    ComputeCPLI
+
+    If cBLFinish = 0 Then
+        SetNA 14, "Baseline Finish column not exported"
+    ElseIf blDueCnt = 0 Then
+        SetNA 14, "No tasks baselined to finish on or before the status date"
+    Else
+        Checks(14).Metric = "BEI = " & Format(completedCnt / blDueCnt, "0.00") & "  (" & completedCnt & _
+                            " completed / " & blDueCnt & " baselined to be complete)"
+        Checks(14).Result = IIf(completedCnt / blDueCnt >= 0.95, "PASS", "FAIL")
+    End If
+End Sub
+
+Private Sub ComputeCPLI()
+    Dim i As Long, finIdx As Long, projFinish As Date, haveFinish As Boolean
+    Dim cpl As Double, tf As Double, cpli As Double
+
+    If cSlack = 0 Or cFinish = 0 Then
+        SetNA 13, "Requires Finish and Total Slack columns"
+        Exit Sub
+    End If
+    For i = 1 To TaskCount
+        With Tasks(i)
+            If Not .IsSummary And .HasFinish Then
+                If Not haveFinish Or .FinishDt > projFinish Then
+                    projFinish = .FinishDt: finIdx = i: haveFinish = True
+                ElseIf .FinishDt = projFinish And .TotalSlack < Tasks(finIdx).TotalSlack Then
+                    finIdx = i
+                End If
+            End If
+        End With
+    Next i
+    If Not haveFinish Then
+        SetNA 13, "No finish dates found"
+        Exit Sub
+    End If
+    If projFinish <= StatusDate Then
+        SetNA 13, "Project finish (" & Format(projFinish, "dd-mmm-yyyy") & ") is on or before the status date"
+        Exit Sub
+    End If
+
+    cpl = Application.WorksheetFunction.NetworkDays(StatusDate, projFinish)
+    tf = Tasks(finIdx).TotalSlack
+    cpli = (cpl + tf) / cpl
+    Checks(13).Metric = "CPLI = " & Format(cpli, "0.00") & "  [CPL " & cpl & " working days from status date to project finish " & _
+                        Format(projFinish, "dd-mmm-yyyy") & "; total float " & tf & " days]"
+    Checks(13).Result = IIf(cpli >= 0.95, "PASS", "FAIL")
+
+    For i = 1 To TaskCount
+        If Not Tasks(i).IsSummary And Tasks(i).HasFinish Then
+            If Tasks(i).FinishDt = projFinish Then
+                Findings(13).Add Array(i, IIf(i = finIdx, "Project finish task used for CPLI", "Also finishes on project finish date"))
+            End If
+        End If
+    Next i
+End Sub
+
+Private Sub SetPctResult(k As Long, cnt As Long, base As Long, maxPct As Double, label As String)
+    If base = 0 Then
+        Checks(k).Metric = "0 of 0 " & label
+        Checks(k).Result = "N/A"
+    Else
+        Checks(k).Metric = cnt & " of " & base & " " & label & " (" & Format(cnt / base, "0.0%") & ")"
+        Checks(k).Result = IIf(cnt / base <= maxPct / 100, "PASS", "FAIL")
+    End If
+End Sub
+
+Private Sub SetNA(k As Long, reason As String)
+    Checks(k).Metric = "Not evaluated - " & reason
+    Checks(k).Result = "N/A"
+End Sub
+
+'=====================================================================
+'  OUTPUT
+'=====================================================================
+Private Sub WriteOutput(wsData As Worksheet)
+    Dim wb As Workbook, k As Long, wsSum As Worksheet, prev As Worksheet
+    Set wb = wsData.Parent
+
+    Application.DisplayAlerts = False
+    DeleteSheetIfExists wb, SUMMARY_SHEET
+    For k = 1 To 14
+        DeleteSheetIfExists wb, Checks(k).SheetName
+    Next k
+    Application.DisplayAlerts = True
+
+    Set wsSum = wb.Worksheets.Add(Before:=wb.Worksheets(1))
+    wsSum.Name = SUMMARY_SHEET
+
+    Set prev = wb.Worksheets(wb.Worksheets.Count)
+    For k = 1 To 14
+        Set prev = WriteCheckSheet(wb, k, prev)
+    Next k
+
+    WriteSummary wsSum, wsData
+    wsSum.Activate
+    wsSum.Range("A1").Select
+End Sub
+
+Private Function WriteCheckSheet(wb As Workbook, k As Long, afterWs As Worksheet) As Worksheet
+    Dim ws As Worksheet, n As Long, i As Long, f As Variant, idx As Long
+    Dim out() As Variant
+
+    Set ws = wb.Worksheets.Add(After:=afterWs)
+    ws.Name = Checks(k).SheetName
+
+    With ws
+        .Range("A1").Value = "DCMA Check " & k & ": " & Checks(k).Title
+        .Range("A1").Font.Bold = True
+        .Range("A1").Font.Size = 14
+        .Range("A2").Value = "Description":  .Range("B2").Value = Checks(k).Description
+        .Range("A3").Value = "Threshold":    .Range("B3").Value = Checks(k).Threshold
+        .Range("A4").Value = "Result":       .Range("B4").Value = Checks(k).Metric
+        .Range("A5").Value = "Status":       .Range("B5").Value = Checks(k).Result
+        .Range("A6").Value = "Status Date":  .Range("B6").Value = StatusDate
+        .Range("B6").NumberFormat = "dd-mmm-yyyy"
+        .Range("A2:A6").Font.Bold = True
+        ColorStatus .Range("B5")
+
+        .Range("A8").Resize(1, 15).Value = Array("Finding", "ID", "Task Name", "% Complete", "Start", "Finish", _
+            "Remaining Dur (days)", "Total Slack (days)", "Constraint Type", "Predecessors", "Successors", _
+            "Baseline Finish", "Actual Start", "Actual Finish", "Resource Names")
+        With .Range("A8:O8")
+            .Font.Bold = True
+            .Interior.Color = RGB(31, 78, 121)
+            .Font.Color = vbWhite
+        End With
+
+        n = Findings(k).Count
+        If n > 0 Then
+            ReDim out(1 To n, 1 To 15)
+            For i = 1 To n
+                f = Findings(k).Item(i)
+                idx = f(0)
+                out(i, 1) = f(1)
+                With Tasks(idx)
+                    out(i, 2) = .ID
+                    out(i, 3) = .Name
+                    out(i, 4) = .PctComplete
+                    If .HasStart Then out(i, 5) = .StartDt Else out(i, 5) = ""
+                    If .HasFinish Then out(i, 6) = .FinishDt Else out(i, 6) = ""
+                    out(i, 7) = Round(.RemDur, 2)
+                    If cSlack > 0 Then out(i, 8) = .TotalSlack Else out(i, 8) = ""
+                    out(i, 9) = .ConstraintType
+                    out(i, 10) = .Preds
+                    out(i, 11) = .Succs
+                    If .HasBLFinish Then out(i, 12) = .BLFinish Else out(i, 12) = ""
+                    If .HasActStart Then out(i, 13) = .ActStart Else out(i, 13) = ""
+                    If .HasActFinish Then out(i, 14) = .ActFinish Else out(i, 14) = ""
+                    out(i, 15) = .Resources
+                End With
+            Next i
+            .Range("A9").Resize(n, 15).Value = out
+            .Range("E9:F" & 8 + n).NumberFormat = "dd-mmm-yyyy"
+            .Range("L9:N" & 8 + n).NumberFormat = "dd-mmm-yyyy"
+            .Range("A8:O" & 8 + n).AutoFilter
+            .Range("A8:O" & 8 + n).Borders.LineStyle = xlContinuous
+        Else
+            .Range("A9").Value = "No tasks tripped this check."
+            .Range("A9").Font.Italic = True
+        End If
+
+        .Columns("A:O").AutoFit
+        .Columns("A").ColumnWidth = 55
+        .Columns("B").ColumnWidth = 8
+        If .Columns("C").ColumnWidth > 50 Then .Columns("C").ColumnWidth = 50
+        If .Columns("J").ColumnWidth > 35 Then .Columns("J").ColumnWidth = 35
+        If .Columns("K").ColumnWidth > 35 Then .Columns("K").ColumnWidth = 35
+        If .Columns("O").ColumnWidth > 35 Then .Columns("O").ColumnWidth = 35
+    End With
+
+    ws.Activate
+    ActiveWindow.FreezePanes = False
+    ws.Range("A9").Select
+    ActiveWindow.FreezePanes = True
+
+    Set WriteCheckSheet = ws
+End Function
+
+Private Sub WriteSummary(ws As Worksheet, wsData As Worksheet)
+    Dim k As Long, r As Long, v As Variant
+
+    With ws
+        .Range("A1").Value = "DCMA 14-Point Schedule Assessment"
+        .Range("A1").Font.Bold = True
+        .Range("A1").Font.Size = 16
+        .Range("A2").Value = "Source sheet":    .Range("B2").Value = wsData.Name
+        .Range("A3").Value = "Status date":     .Range("B3").Value = StatusDate
+        .Range("B3").NumberFormat = "dd-mmm-yyyy"
+        .Range("A4").Value = "Scope":           .Range("B4").Value = gNonSummary & " non-summary tasks (" & gIncomplete & _
+                                                " incomplete), " & gRelTotal & " relationships on incomplete tasks"
+        .Range("A5").Value = "Run on":          .Range("B5").Value = Now
+        .Range("B5").NumberFormat = "dd-mmm-yyyy hh:mm"
+        .Range("A2:A5").Font.Bold = True
+
+        .Range("A7").Resize(1, 8).Value = Array("#", "Check", "Description", "Threshold", "Result / Metric", "Status", "Items Listed", "Detail Tab")
+        With .Range("A7:H7")
+            .Font.Bold = True
+            .Interior.Color = RGB(31, 78, 121)
+            .Font.Color = vbWhite
+        End With
+
+        For k = 1 To 14
+            r = 7 + k
+            .Cells(r, 1).Value = k
+            .Cells(r, 2).Value = Checks(k).Title
+            .Cells(r, 3).Value = Checks(k).Description
+            .Cells(r, 4).Value = Checks(k).Threshold
+            .Cells(r, 5).Value = Checks(k).Metric
+            .Cells(r, 6).Value = Checks(k).Result
+            ColorStatus .Cells(r, 6)
+            .Cells(r, 7).Value = Findings(k).Count
+            .Hyperlinks.Add Anchor:=.Cells(r, 8), Address:="", _
+                SubAddress:="'" & Checks(k).SheetName & "'!A1", TextToDisplay:=Checks(k).SheetName
+        Next k
+
+        .Range("A7:H21").Borders.LineStyle = xlContinuous
+        .Range("A8:H21").VerticalAlignment = xlTop
+        .Range("C8:E21").WrapText = True
+        .Range("B8:B21").WrapText = True
+        .Columns("A").ColumnWidth = 4
+        .Columns("B").ColumnWidth = 26
+        .Columns("C").ColumnWidth = 60
+        .Columns("D").ColumnWidth = 26
+        .Columns("E").ColumnWidth = 48
+        .Columns("F").ColumnWidth = 10
+        .Columns("G").ColumnWidth = 12
+        .Columns("H").ColumnWidth = 24
+        .Range("A8:H21").Rows.AutoFit
+        .Range("A8:A21").HorizontalAlignment = xlCenter
+        .Range("F8:G21").HorizontalAlignment = xlCenter
+
+        r = 24
+        .Cells(r, 1).Value = "Notes / Assumptions"
+        .Cells(r, 1).Font.Bold = True
+        For Each v In Notes
+            r = r + 1
+            .Cells(r, 1).Value = "- " & v
+        Next v
+    End With
+End Sub
+
+Private Sub ColorStatus(rng As Range)
+    rng.Font.Bold = True
+    rng.HorizontalAlignment = xlCenter
+    Select Case UCase(CStr(rng.Value))
+        Case "PASS"
+            rng.Interior.Color = RGB(198, 239, 206): rng.Font.Color = RGB(0, 97, 0)
+        Case "FAIL"
+            rng.Interior.Color = RGB(255, 199, 206): rng.Font.Color = RGB(156, 0, 6)
+        Case Else
+            rng.Interior.Color = RGB(237, 237, 237): rng.Font.Color = RGB(89, 89, 89)
+    End Select
+End Sub
+
+Private Sub DeleteSheetIfExists(wb As Workbook, nm As String)
+    Dim ws As Worksheet
+    On Error Resume Next
+    Set ws = wb.Worksheets(nm)
+    On Error GoTo 0
+    If Not ws Is Nothing Then ws.Delete
+End Sub
+
+'=====================================================================
+'  PARSING HELPERS
+'=====================================================================
+Private Function GetCell(data As Variant, r As Long, c As Long) As Variant
+    If c = 0 Then GetCell = Empty Else GetCell = data(r, c)
+End Function
+
+Private Function GetStr(data As Variant, r As Long, c As Long) As String
+    If c = 0 Then Exit Function
+    If IsError(data(r, c)) Or IsNull(data(r, c)) Then Exit Function
+    GetStr = CStr(data(r, c))
+End Function
+
+Private Function ParseBool(s As String) As Boolean
+    Select Case LCase(Trim(s))
+        Case "yes", "true", "-1", "1", "y": ParseBool = True
+    End Select
+End Function
+
+' Accepts a cell value that may be a real date, a serial number, or text
+' such as "Mon 1/6/25 8:00 AM" or "NA"
+Private Function TryDate(v As Variant, ByRef d As Date) As Boolean
+    Dim s As String, p As Long
+    If IsEmpty(v) Or IsError(v) Or IsNull(v) Then Exit Function
+    Select Case VarType(v)
+        Case vbDate
+            d = v: TryDate = True
+        Case vbDouble, vbSingle, vbLong, vbInteger, vbCurrency, vbDecimal
+            If v > 20000 Then d = CDate(v): TryDate = True
+        Case vbString
+            s = Trim(v)
+            If Len(s) = 0 Or UCase(s) = "NA" Then Exit Function
+            If IsDate(s) Then
+                d = CDate(s): TryDate = True
+            Else
+                p = InStr(s, " ")                     ' strip leading weekday name
+                If p > 0 Then
+                    s = Trim(Mid(s, p + 1))
+                    If IsDate(s) Then d = CDate(s): TryDate = True
+                End If
+            End If
+    End Select
+End Function
+
+' Converts MS Project duration text ("10 days", "5 days?", "8 hrs", "2 wks",
+' "1 mon", "3 edays", "-2 days", "+10%") to a number of days
+Private Function ParseDurationDays(txt As String) As Double
+    Dim t As String, n As Double
+    t = LCase(Trim(txt))
+    If Len(t) = 0 Then Exit Function
+    t = Replace(t, "?", "")
+    t = Replace(t, "+", "")
+    If IsNumeric(t) Then
+        ParseDurationDays = CDbl(t)
+        Exit Function
+    End If
+    n = Val(t)
+    If InStr(t, "mo") > 0 Then            ' mon(s), month(s)
+        n = n * DAYS_PER_MONTH
+    ElseIf InStr(t, "w") > 0 Then         ' wk(s), week(s)
+        n = n * DAYS_PER_WEEK
+    ElseIf InStr(t, "h") > 0 Then         ' hr(s), hour(s)
+        n = n / HOURS_PER_DAY
+    ElseIf InStr(t, "mi") > 0 Then        ' min(s)
+        n = n / (HOURS_PER_DAY * 60)
+    End If                                ' day(s), eday(s), % lag: left as-is
+    ParseDurationDays = n
+End Function
+
+' Parses one predecessor token such as "12", "12FS", "12SS+2 days", "12FF-1 day",
+' "Other.mpp\12FS" into ID, relationship type and lag (days, signed)
+Private Function ParseLink(token As String, ByRef pid As Long, ByRef relType As String, ByRef lagDays As Double) As Boolean
+    Dim t As String, i As Long, digits As String, rest As String
+    pid = 0: relType = "FS": lagDays = 0
+    t = Trim(token)
+    If Len(t) = 0 Then Exit Function
+    If InStr(t, "\") > 0 Then t = Mid(t, InStrRev(t, "\") + 1)   ' external link
+
+    i = 1
+    Do While i <= Len(t)
+        If Mid(t, i, 1) Like "#" Then
+            digits = digits & Mid(t, i, 1)
+            i = i + 1
+        Else
+            Exit Do
+        End If
+    Loop
+    If Len(digits) = 0 Then Exit Function
+    pid = CLng(digits)
+
+    rest = Trim(Mid(t, i))
+    If Len(rest) >= 2 Then
+        Select Case UCase(Left(rest, 2))
+            Case "FS", "SS", "FF", "SF"
+                relType = UCase(Left(rest, 2))
+                rest = Trim(Mid(rest, 3))
+        End Select
+    End If
+    If Len(rest) > 0 Then lagDays = ParseDurationDays(rest)
+    ParseLink = True
+End Function
+
+Private Function TaskNameByID(pid As Long) As String
+    Dim idx As Long
+    On Error Resume Next
+    idx = IdMap.Item(CStr(pid))
+    On Error GoTo 0
+    If idx > 0 Then TaskNameByID = Tasks(idx).Name Else TaskNameByID = "not in export"
+End Function
